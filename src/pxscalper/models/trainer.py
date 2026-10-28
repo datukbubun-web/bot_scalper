@@ -47,6 +47,9 @@ class TrainConfig:
     warmup_frac: float = 0.05
     patience: int = 6
     ema_decay: float = 0.995
+    #: Ramp the EMA decay in over the run. Without this the averaged weights lag
+    #: the live weights by ~200 steps and the shipped model is near-random.
+    ema_warmup: bool = True
     label_smoothing: float = 0.02
     class_balance: bool = True
     num_workers: int = 0
@@ -91,6 +94,10 @@ class TrainHistory:
     best_epoch: int = -1
     best_val_loss: float = float("inf")
     seconds: float = 0.0
+    #: NLL of always predicting the training class frequencies on the validation
+    #: set. A model that cannot beat this has learned nothing worth shipping.
+    baseline_val_loss: float = float("nan")
+    beat_baseline: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -102,34 +109,79 @@ class TrainHistory:
             "best_epoch": self.best_epoch,
             "best_val_loss": self.best_val_loss,
             "seconds": self.seconds,
+            "baseline_val_loss": self.baseline_val_loss,
+            "beat_baseline": self.beat_baseline,
         }
 
 
 class _EMA:
-    def __init__(self, model: nn.Module, decay: float) -> None:
-        self.decay = decay
+    """Exponential moving average of the weights, with warmup debiasing.
+
+    A fixed ``decay=0.995`` has an effective memory of ~200 steps. With a small
+    dataset that is *more than the whole epoch*: the averaged weights stay close
+    to the random initialisation while the live weights learn, so the checkpoint
+    that ships scores no better than a coin flip. This was measured, not
+    theorised -- see ``scripts/training/ablate_tcn.py``.
+
+    The standard fix (Timm / HuggingFace / timm's ``ModelEmaV2``) ramps the decay
+    in as ``min(decay, (1 + step) / (10 + step))``, so averaging has no memory
+    longer than the run itself.
+    """
+
+    def __init__(self, model: nn.Module, decay: float, warmup: bool = True,
+                 warmup_steps: int = 2000) -> None:
+        self.base_decay = decay
+        self.warmup = warmup
+        self.warmup_steps = max(warmup_steps, 1)
+        self.step = 0
         self.shadow = copy.deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
+    @property
+    def decay(self) -> float:
+        if not self.warmup:
+            return self.base_decay
+        # (1+step)/(10+step) is 0.18 at step 1, 0.85 at step 50, 0.98 at step 500
+        effective = (1.0 + self.step) / (10.0 + self.step)
+        return min(self.base_decay, effective)
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        self.step += 1
+        decay = self.decay
         for s_param, param in zip(self.shadow.state_dict().values(), model.state_dict().values()):
             if s_param.dtype.is_floating_point:
-                s_param.mul_(self.decay).add_(param.detach(), alpha=1 - self.decay)
+                s_param.mul_(decay).add_(param.detach(), alpha=1 - decay)
             else:
                 s_param.copy_(param)
 
 
 class Trainer:
-    def __init__(self, model: nn.Module, config: TrainConfig, class_weight: torch.Tensor | None = None):
+    def __init__(
+        self,
+        model: nn.Module,
+        config: TrainConfig,
+        class_weight: torch.Tensor | None = None,
+        window_overlap: int = 1,
+    ):
         self.model = model.to(config.device)
+        #: Bars shared between consecutive windows; used to de-overlap the
+        #: directional-Sharpe metric so it is not inflated by sqrt(overlap).
+        self.window_overlap = max(int(window_overlap), 1)
         self.config = config
+        # Training objective: optionally class-weighted so the flat class is not
+        # drowned out.
         self.loss_fn: nn.Module = (
             nn.CrossEntropyLoss(weight=class_weight, label_smoothing=config.label_smoothing)
             if class_weight is not None
             else nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
         )
+        # *Selection* objective. Deliberately plain, unweighted, unsmoothed NLL:
+        # a weighted/smoothed loss is not comparable to the class-frequency
+        # baseline, and picking the epoch on a different objective than the one
+        # you report is how a model gets shipped with nothing learned.
+        self.eval_loss_fn: nn.Module = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.lr, weight_decay=config.weight_decay
         )
@@ -155,6 +207,11 @@ class Trainer:
         val_ds: WindowDataset,
         y_ret: np.ndarray | None = None,
     ) -> TrainHistory:
+        """Train, then restore the best-validation weights.
+
+        ``y_ret`` must be aligned with ``val_ds`` (same order, same length);
+        otherwise the directional metric silently compares different bars.
+        """
         cfg = self.config
         history = TrainHistory()
         started = time.time()
@@ -165,6 +222,7 @@ class Trainer:
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
         total_steps = max(len(loader) * cfg.epochs, 1)
         scheduler = self._scheduler(total_steps)
+        history.baseline_val_loss = self._baseline_loss(train_ds, val_ds, len(loader), cfg.epochs)
         best_state = copy.deepcopy(self.ema.shadow.state_dict())
         patience_left = cfg.patience
 
@@ -212,7 +270,30 @@ class Trainer:
         self.ema.shadow.load_state_dict(best_state)
         self.model.load_state_dict(best_state)
         history.seconds = time.time() - started
+        history.beat_baseline = bool(np.isfinite(history.baseline_val_loss)) and (
+            history.best_val_loss < history.baseline_val_loss
+        )
+        if not history.beat_baseline:
+            log.warning(
+                "model did NOT beat the class-frequency baseline "
+                "(val %.4f vs baseline %.4f): it has not learned the signal",
+                history.best_val_loss, history.baseline_val_loss,
+            )
         return history
+
+    @torch.no_grad()
+    def _baseline_loss(self, train_ds: WindowDataset, val_ds: WindowDataset,
+                       n_batches: int, epochs: int) -> float:
+        """NLL of predicting the training class frequencies on ``val_ds``.
+
+        This is the "did it learn anything" line. Random guessing gives
+        ``ln(3)=1.0986``; the class-frequency prior gives ``H(class)``, which is
+        lower, so beating *that* is the honest test -- not beating a coin flip.
+        """
+        counts = torch.bincount(train_ds.labels, minlength=3).float()
+        prior = (counts / counts.sum()).clamp_min(1e-9)
+        y = val_ds.labels
+        return float(-torch.log(prior[y]).mean())
 
     # ------------------------------------------------------------------ evaluate
     @torch.no_grad()
@@ -223,7 +304,7 @@ class Trainer:
         for x, y in loader:
             x, y = x.to(self.config.device), y.to(self.config.device)
             logits = model(x)
-            total_loss += float(self.loss_fn(logits, y)) * x.shape[0]
+            total_loss += float(self.eval_loss_fn(logits, y)) * x.shape[0]
             pred = logits.argmax(dim=-1)
             correct += int((pred == y).sum())
             mask = y != 1  # class 1 is the "flat" class after the +1 shift
@@ -237,17 +318,17 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def _directional_sharpe(
+    def _trade_pnls(
         self, model: nn.Module, loader: DataLoader, y_ret: np.ndarray | None
-    ) -> float:
-        """Sharpe of a trivial strategy: trade the predicted direction, size 1.
+    ) -> np.ndarray:
+        """Per-trade PnL of a "trade the predicted direction" strategy.
 
-        This is a *model-selection* metric, not a backtest -- costs, spread and
-        position sizing arrive later in the risk/backtest layers. Its only job is
-        to stop us shipping a model that is accurate but uselessly late.
+        Consecutive windows overlap by ``lookback - 1`` bars, so their outcomes are
+        almost identical. Taking every ``overlap``-th observation makes each entry
+        a distinct trade; skipping this inflates any statistic by ~sqrt(overlap).
         """
         if y_ret is None or len(y_ret) == 0:
-            return 0.0
+            return np.empty(0)
         model.eval()
         preds: list[np.ndarray] = []
         for x, _ in loader:
@@ -255,8 +336,23 @@ class Trainer:
             preds.append(logits.argmax(dim=-1).cpu().numpy())
         pred_dir = np.concatenate(preds) - 1 if preds else np.array([])
         n = min(len(pred_dir), len(y_ret))
-        pnl = pred_dir[:n] * y_ret[:n]
-        if pnl.std() == 0:
+        if n == 0:
+            return np.empty(0)
+        pnl = pred_dir[:n] * np.asarray(y_ret)[:n]
+        return pnl[:: self.window_overlap]
+
+    @torch.no_grad()
+    def _directional_sharpe(
+        self, model: nn.Module, loader: DataLoader, y_ret: np.ndarray | None
+    ) -> float:
+        """Annualised Sharpe of the de-overlapped per-trade PnLs.
+
+        This is a *model-selection* metric, not a backtest -- costs, spread and
+        position sizing arrive later in the risk/backtest layers. Its only job is
+        to stop us shipping a model that is accurate but uselessly late.
+        """
+        pnl = self._trade_pnls(model, loader, y_ret)
+        if pnl.size < 2 or pnl.std() == 0:
             return 0.0
         return float(pnl.mean() / pnl.std() * math.sqrt(252 * 390))
 

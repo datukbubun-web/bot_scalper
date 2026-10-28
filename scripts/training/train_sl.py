@@ -52,6 +52,12 @@ def main() -> int:
     ap.add_argument("--export", action="store_true", help="export TorchScript + ONNX after training")
     ap.add_argument("--version", default="latest", help="artifact folder name")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--no-ema-warmup", action="store_true",
+                    help="disable EMA decay ramp (reproduces the near-random "
+                         "checkpoint bug: see scripts/training/ablate_tcn.py)")
+    ap.add_argument("--fail-if-no-edge", action="store_true",
+                    help="exit non-zero when the model does not beat the "
+                         "class-frequency baseline (use this in CI)")
     args = ap.parse_args()
 
     load_dotenv(".env")
@@ -100,18 +106,33 @@ def main() -> int:
     )
     model = build_sequence_model(args.arch, mcfg)
 
+    # ---- purged split -------------------------------------------------------
+    # A validation window ending at bar t looks back ``lookback`` bars and its
+    # label spans t..t+horizon. If bar t - lookback + 1 is <= the last label end
+    # in training, validation literally contains training bars. The purge gap
+    # must therefore cover BOTH the input window and the label horizon.
+    purge = args.lookback + args.horizon + args.embargo
     split = int(len(windows) * (1 - args.val_frac))
-    train_end = max(split - args.embargo, 1)
+    train_end = max(split - purge, 1)
+    val_start = split
+    if val_start <= train_end:
+        raise SystemExit("val_frac too small: purged split leaves no training data")
     train_ds = WindowDataset(windows[:train_end], y[:train_end])
-    val_ds = WindowDataset(windows[split:], y[split:])
+    val_ds = WindowDataset(windows[val_start:], y[val_start:])
     weights = class_weights(y[:train_end])
+    print(
+        f"purged split: train {len(train_ds)} | purge {purge} bars | val {len(val_ds)} "
+        f"| overlap windows {args.lookback}"
+    )
 
     trainer = Trainer(
         model,
-        TrainConfig(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, class_balance=True),
+        TrainConfig(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                    class_balance=True, ema_warmup=not args.no_ema_warmup),
         weights,
+        window_overlap=args.lookback,
     )
-    history = trainer.fit(train_ds, val_ds, y_ret=y_ret[split:])
+    history = trainer.fit(train_ds, val_ds, y_ret=y_ret[val_start:])
 
     # ------------------------------------------------------------- artifacts
     model_dir = paths.model_dir(args.version)
@@ -136,6 +157,12 @@ def main() -> int:
     print(f"best epoch {history.best_epoch} | val loss {history.best_val_loss:.4f} | "
           f"acc(non-flat) {history.val_acc_nonflat[history.best_epoch]:.3f} | "
           f"dir. sharpe {history.val_sharpe[history.best_epoch]:.2f}")
+    print(f"baseline kelas-frekuensi {history.baseline_val_loss:.4f} | "
+          f"{'LULUS' if history.beat_baseline else 'GAGAL'} mengalahkan baseline")
+    if args.fail_if_no_edge and not history.beat_baseline:
+        print("FAIL: model tidak mengalahkan baseline; tidak ada sinyal yang bisa "
+              "dikirim. Turunkan ekspektasi atau perbaiki model.", file=sys.stderr)
+        return 3
 
     if args.export:
         from pxscalper.inference.export import export_all

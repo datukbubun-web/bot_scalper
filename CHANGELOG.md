@@ -22,3 +22,34 @@ Rilis pertama: kerangka lengkap, diuji end-to-end.
 ### Catatan
 - API v3 belum menyediakan websocket → bot polling; cocok untuk scalping 1 menit, bukan HFT.
 - Fitur order-flow memakai proxy tick-rule karena L2 book belum tersedia.
+
+## [Unreleased] — 2026-10-29
+
+### Fixed (training pipeline — each one made a shipped model worse than random)
+- **EMA anchored to the random initialisation.** A fixed `decay=0.995` has a
+  ~200-step memory; a 62-step epoch never reaches the live weights. Measured
+  cost: non-flat accuracy 0.446 → 0.306, log-loss 1.0960 → 1.1075. EMA decay now
+  ramps in (`min(decay, (1+step)/(10+step))`).
+- **Selection objective ≠ reported objective.** Epoch selection used the
+  class-weighted, label-smoothed loss but was compared to an unweighted
+  class-frequency baseline. Selection now uses plain unweighted NLL.
+- **Directional Sharpe inflated by √overlap.** Overlapping windows (63 shared
+  bars) were counted as independent trades. Now sampled once per non-overlapping
+  window.
+- **Validation contained training bars.** The purge gap ignored the input window;
+  now `lookback + horizon + embargo`.
+- **No "did it learn anything" gate.** `Trainer.fit` now reports the
+  class-frequency baseline and `history.beat_baseline`;
+  `train_sl.py --fail-if-no-edge` exits 3 when the model loses to it.
+
+### Changed
+- `train_sl.py`: `--no-download` (never overwrite a large cache) and
+  `--no-ema-warmup` (reproduce the old behaviour for comparison).
+- `evaluate_real.py`: `--n-bars` to bound RAM (windows are 38×64 float32 each;
+  200k bars needs ~1.9 GB).
+
+### Added
+- `docs/TCN_FIX_REPORT.md` — evidence, ablation tables, and the (negative) result.
+- `scripts/training/{ablate_tcn,sweep_tcn,skip_tcn_experiment}.py` — the
+  experiments, re-runnable.
+- `tests/test_trainer_integrity.py` — 8 tests pinning the fixes above.
