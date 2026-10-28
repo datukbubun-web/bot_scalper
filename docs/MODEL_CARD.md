@@ -57,3 +57,16 @@
 ## Catatan etika & kepatuhan
 
 Perdagangan leveraged dapat menyebabkan kerugian melebihi ekspektasi. Pastikan Anda memenuhi syarat hukum di yurisdiksi Anda, bahwa akun PrimeXBT Anda memang boleh dipakai bot, dan bahwa Anda memahami risiko likuidasi. Repo ini tidak memberi nasihat keuangan.
+
+## Ship criteria (enforced, not aspirational)
+
+A checkpoint may only be described as an "edge" if it passes ALL of these:
+
+1. `history.beat_baseline == True` — held-out NLL must beat the class-frequency
+   prior (not just a coin flip, which is a weaker bar: `ln(3) = 1.0986`).
+2. Validation is purged: `purge = lookback + horizon + embargo`.
+3. Reported directional Sharpe is de-overlapped (`window_overlap = lookback`).
+
+`python3 scripts/training/train_sl.py ... --fail-if-no-edge` exits 3 when (1)
+fails. As of 2026-10-29 the TCN fails this bar on XAU/USD 5M/15M and EUR/USD 5M;
+see `docs/TCN_FIX_REPORT.md`.
