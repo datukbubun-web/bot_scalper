@@ -41,20 +41,33 @@ class DataPipeline:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ caching
-    def _path(self, symbol: str, bar_size: str) -> Path:
+    def _path(self, symbol: str, bar_size: str, suffix: str = ".parquet") -> Path:
         safe = symbol.replace("/", "")
-        return self.cache_dir / f"{safe}_{bar_size}.parquet"
+        return self.cache_dir / f"{safe}_{bar_size}{suffix}"
 
     def load(self, symbol: str, bar_size: str) -> pd.DataFrame | None:
-        path = self._path(symbol, bar_size)
-        if not path.exists():
-            return None
-        return pd.read_parquet(path)
+        """Read the cache, whatever format it was written in."""
+        for suffix in (".parquet", ".csv.gz", ".csv"):
+            path = self._path(symbol, bar_size, suffix)
+            if path.exists():
+                frame = (
+                    pd.read_parquet(path)
+                    if suffix == ".parquet"
+                    else pd.read_csv(path, compression="infer")
+                )
+                return frame
+        return None
 
     def save(self, symbol: str, bar_size: str, bars: pd.DataFrame) -> Path:
-        path = self._path(symbol, bar_size)
+        """Parquet when pyarrow is available, else gzipped CSV (same API)."""
         bars = bars.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-        bars.to_parquet(path, index=False)
+        try:
+            path = self._path(symbol, bar_size, ".parquet")
+            bars.to_parquet(path, index=False)
+        except ImportError:
+            path = self._path(symbol, bar_size, ".csv.gz")
+            bars.to_csv(path, index=False, compression="gzip")
+            log.info("pyarrow absent -> cached as compressed CSV")
         log.info("cached %d bars -> %s", len(bars), path)
         return path
 

@@ -231,6 +231,52 @@ def trade(
 
 
 @app.command()
+def catalogue(
+    fx_only: bool = typer.Option(True, help="only show FX-like instruments"),
+    max_spread: float = typer.Option(3.0, help="max spread in bps"),
+    limit: int = typer.Option(25),
+    equity: float = typer.Option(10_000.0, help="account equity used for feasibility"),
+    leverage: float = typer.Option(5.0, help="position cap used for feasibility"),
+) -> None:
+    """What the account can actually trade -- spread, size step, feasibility.
+
+    Run this BEFORE choosing symbols. PrimeXBT FX is sized in whole base-currency
+    units (EUR/USD: 1000 EUR per step, USD/JPY: 1000 JPY per step ≈ $157k of
+    notional), so a small account usually cannot trade every pair.
+    """
+    _bootstrap()
+    from .exchange.catalogue import SymbolResolver, resolve_units
+
+    resolver = SymbolResolver(_client())
+    resolver.refresh()
+    pool = resolver.fx_instruments() if fx_only else list(resolver._instruments.values())
+    rows = [i for i in pool if i.market_open and i.spread_bps <= max_spread]
+
+    table = Table(title=f"kandidat trading (spread <= {max_spread} bps, open)")
+    for col in ("symbol", "class", "price", "spread", "step", "$/step", "minRisk$", "tradable"):
+        table.add_column(col, justify="right" if col not in ("symbol", "class", "tradable") else "left")
+
+    room = equity * leverage
+    for instrument in sorted(rows, key=lambda i: i.spread_bps)[:limit]:
+        step_notional = resolver.notional_per_step(instrument)
+        qty, notional, _note = resolve_units(instrument, room)
+        feasible = qty > 0
+        table.add_row(
+            instrument.symbol, instrument.category, f"{instrument.price:,.5f}",
+            f"{instrument.spread_bps:.2f}", f"{instrument.qty_step:g}",
+            f"${step_notional:,.0f}" if step_notional else "n/a",
+            f"${step_notional / leverage:,.0f}" if step_notional else "n/a",
+            "[green]yes[/green]" if feasible else "[red]too coarse[/red]",
+        )
+    console.print(table)
+    console.print(
+        f"[dim]equity ${equity:,.0f} x {leverage:g} = ${room:,.0f} notional room. "
+        "'too coarse' = one qtyStep already exceeds that room. "
+        "minRisk$ = margin needed for a single step at this leverage.[/dim]"
+    )
+
+
+@app.command()
 def reconcile() -> None:
     """Compare the local journal with the exchange and fix drift."""
     _bootstrap()

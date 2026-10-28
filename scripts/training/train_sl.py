@@ -36,7 +36,11 @@ def main() -> int:
     ap.add_argument("--arch", default="tcn", choices=["tcn", "lstm", "gru", "transformer"])
     ap.add_argument("--symbol", default="EUR/USD")
     ap.add_argument("--bars", default="1M", help="bar size: 1M 5M 15M 1H ...")
-    ap.add_argument("--n-bars", type=int, default=60_000)
+    ap.add_argument("--n-bars", type=int, default=60_000,
+                    help="bars to train on (taken from the END of the cache, so the "
+                         "most recent regime is used)")
+    ap.add_argument("--no-download", action="store_true",
+                    help="use only cached bars; never fetch (keeps a big cache intact)")
     ap.add_argument("--lookback", type=int, default=64)
     ap.add_argument("--horizon", type=int, default=5)
     ap.add_argument("--epochs", type=int, default=40)
@@ -62,9 +66,15 @@ def main() -> int:
         client = PrimeXBTClient()  # bars are unsigned
         pipeline = DataPipeline(cache_dir=paths.data, client=client)
         cached = pipeline.load(args.symbol, args.bars)
-        bars = cached if cached is not None and len(cached) >= args.n_bars else pipeline.download(
-            args.symbol, args.bars, args.n_bars
-        )
+        if cached is not None and len(cached) >= args.n_bars:
+            bars = cached.tail(args.n_bars).reset_index(drop=True)
+        elif args.no_download:
+            raise SystemExit(
+                f"cache has {0 if cached is None else len(cached)} bars for "
+                f"{args.symbol} {args.bars}, need {args.n_bars} (--no-download)"
+            )
+        else:
+            bars = pipeline.download(args.symbol, args.bars, args.n_bars)
     print(f"{args.symbol} {args.bars}: {len(bars)} bars "
           f"({bars['time'].iloc[0]} -> {bars['time'].iloc[-1]})")
 

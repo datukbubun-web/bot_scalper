@@ -77,8 +77,19 @@ def test_min_size_rejection_never_rounds_up(engine):
     assert "minimum" in verdict.reason
 
 
+def test_intraday_brake_pauses_before_daily_limit(engine):
+    """FX never closes, so a small intraday drawdown must pause trading before
+    the (much looser) daily limit is touched."""
+    engine.on_account(10_000)
+    verdict = _evaluate(engine, equity=9_900)  # -1.0% intraday, daily limit is 2%
+    assert verdict.decision is RiskDecision.FLAT
+    assert "intraday" in verdict.reason
+
+
 def test_daily_loss_engages_kill_switch(engine, tmp_path):
     engine.on_account(10_000)
+    # intraday brake off for this test: we want to prove the *daily* guard fires
+    engine.config.max_intraday_loss_pct = 0.0
     verdict = _evaluate(engine, equity=9_700)  # -3% vs 2% limit
     assert verdict.decision is RiskDecision.BLOCK
     assert engine.kill.engaged()

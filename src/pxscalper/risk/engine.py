@@ -84,6 +84,10 @@ class RiskConfig:
     # account guards
     max_daily_loss_pct: float = 2.0
     max_drawdown_pct: float = 5.0
+    # Intraday brake. FX trades 24h, so "daily loss" alone is too coarse: this
+    # flattens and pauses after a small intraday drawdown, then resumes when the
+    # UTC day rolls. 0 disables it.
+    max_intraday_loss_pct: float = 0.75
     max_daily_trades: int = 60
     consecutive_loss_cooldown: int = 3
     cooldown_minutes: int = 30
@@ -116,6 +120,7 @@ class RiskState:
 
     day: str = ""
     day_start_equity: float = 0.0
+    intraday_peak_equity: float = 0.0
     realised_pnl_today: float = 0.0
     trades_today: int = 0
     peak_equity: float = 0.0
@@ -192,18 +197,36 @@ class KillSwitch:
             log.warning("kill switch released")
 
 
-def pnl_coefficient(symbol: str, price: float) -> float:
-    """Account-currency PnL per 1.0 price move, per 1 unit of base currency.
+USD_STABLE = {"USD", "USDT", "USDC", "USDE"}
 
-    ``EUR/USD``  -> 1.0          (quote is USD; long 1000 EUR gains 1000 * dP)
-    ``USD/JPY``  -> 1/price      (quote is JPY; convert back to USD)
+
+def pnl_coefficient(symbol: str, price: float, quote_usd_rate: float | None = None) -> float:
+    """USD PnL per 1.0 price move, per 1 unit of base currency.
+
+    Three genuinely different cases -- conflating them mis-sizes risk by orders of
+    magnitude (an early version of this function priced USD/JPY at 157x too high):
+
+    ``EUR/USD``  quote is USD      -> 1.0
+    ``USD/JPY``  base is USD       -> 1/price   (PnL lands in JPY, convert back)
+    ``XAU/JPY``  neither is USD    -> quote_usd_rate (e.g. JPY->USD = 1/USDJPY)
+
+    ``quote_usd_rate`` must come from the live catalogue (USD/<quote> price). When
+    it is unknown the caller must refuse the trade rather than guess: a guessed
+    coefficient silently multiplies the risk budget.
     """
     base, _, quote = symbol.partition("/")
-    if quote.upper() in ("USD", "USDT", "USDC"):
+    quote, base = quote.upper(), base.upper()
+    if quote in USD_STABLE:
         return 1.0
-    if base.upper() in ("USD", "USDT", "USDC"):
+    if base in USD_STABLE:
         return 1.0 / max(price, 1e-9)
-    return 1.0  # unknown quoting: assume USD-settled, risk engine stays conservative
+    if quote_usd_rate is not None:
+        return float(quote_usd_rate)
+    raise ValueError(
+        f"{symbol}: PnL coefficient needs the {quote}->USD rate; pass quote_usd_rate "
+        f"(the live catalogue provides it). Refusing to guess -- a wrong coefficient "
+        f"mis-sizes risk."
+    )
 
 
 class RiskEngine:
@@ -225,13 +248,18 @@ class RiskEngine:
         if self.state.day != day:
             self.state.day = day
             self.state.day_start_equity = equity
+            self.state.intraday_peak_equity = equity
             self.state.realised_pnl_today = 0.0
             self.state.trades_today = 0
             log.info("new UTC trading day %s, equity %.2f", day, equity)
         if equity > self.state.peak_equity:
             self.state.peak_equity = equity
+        if equity > self.state.intraday_peak_equity:
+            self.state.intraday_peak_equity = equity
         if self.state.day_start_equity <= 0:
             self.state.day_start_equity = equity
+        if self.state.intraday_peak_equity <= 0:
+            self.state.intraday_peak_equity = equity
 
     def on_trade_closed(self, pnl: float) -> None:
         self.state.realised_pnl_today += pnl
@@ -270,6 +298,7 @@ class RiskEngine:
         open_positions: list[dict[str, Any]] | None = None,
         gross_exposure: float = 0.0,
         now_ms: int | None = None,
+        quote_usd_rate: float | None = None,
     ) -> RiskVerdict:
         """Decide FLAT / ALLOW / ALLOW_REDUCED / BLOCK with an auditable reason."""
         cfg = self.config
@@ -361,7 +390,23 @@ class RiskEngine:
                         RiskDecision.BLOCK, f"correlated exposure already open ({others[0]})"
                     )
 
-        # 9. daily loss --------------------------------------------------------
+        # 9. intraday brake ----------------------------------------------------
+        if cfg.max_intraday_loss_pct > 0 and self.state.intraday_peak_equity > 0:
+            intraday_dd = (
+                (self.state.intraday_peak_equity - equity)
+                / self.state.intraday_peak_equity
+                * 100
+            )
+            checks["intraday_ok"] = intraday_dd < cfg.max_intraday_loss_pct
+            details["intraday_drawdown_pct"] = intraday_dd
+            if not checks["intraday_ok"]:
+                return verdict(
+                    RiskDecision.FLAT,
+                    f"intraday drawdown {intraday_dd:.2f}% >= "
+                    f"{cfg.max_intraday_loss_pct}% -> pause until UTC rollover",
+                )
+
+        # 10. daily loss -------------------------------------------------------
         day_pnl_pct = (
             (equity - self.state.day_start_equity) / self.state.day_start_equity * 100
             if self.state.day_start_equity
@@ -394,7 +439,11 @@ class RiskEngine:
         # ------------------------------------------------------- position sizing
         stop_distance = max(cfg.sl_atr * atr, price * 1e-6)
         risk_amount = equity * cfg.risk_per_trade_pct / 100.0
-        coeff = pnl_coefficient(symbol, price)
+        try:
+            coeff = pnl_coefficient(symbol, price, quote_usd_rate)
+        except ValueError as exc:
+            checks["pnl_coefficient"] = False
+            return verdict(RiskDecision.BLOCK, str(exc))
         raw_qty = risk_amount / max(stop_distance * coeff, 1e-12)
 
         # cap by leverage / gross exposure
@@ -419,6 +468,23 @@ class RiskEngine:
                 f"sized qty {qty:.8f} below exchange minimum {min_qty} "
                 f"(raise risk_per_trade_pct or pick a smaller-increment symbol)",
                 details={**details, "raw_qty": raw_qty},
+            )
+
+        # one step of the instrument must be affordable within the risk budget
+        step_notional = qty_step * price * coeff
+        max_notional_room = min(
+            equity * cfg.max_leverage, equity * cfg.max_gross_exposure_pct / 100.0
+        )
+        checks["step_feasible"] = step_notional <= max_notional_room if qty_step > 0 else True
+        details["qty_step"] = qty_step
+        details["notional_per_step"] = step_notional
+        details["max_notional_room"] = max_notional_room
+        if not checks["step_feasible"]:
+            return verdict(
+                RiskDecision.BLOCK,
+                f"instrument too coarse: 1 step ({qty_step:g} units) = "
+                f"${step_notional:,.0f} notional > ${max_notional_room:,.0f} allowed "
+                f"(raise capital/leverage, or trade a finer-grained symbol)",
             )
 
         actual_risk = qty * stop_distance * coeff

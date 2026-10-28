@@ -35,7 +35,23 @@ __all__ = ["BacktestConfig", "BacktestResult", "Backtester", "Trade"]
 class BacktestConfig:
     initial_equity: float = 10_000.0
     taker_fee_pct: float = 0.05          # % per side
-    slippage_coef: float = 0.05          # sqrt impact
+    #: Sqrt-impact coefficient. Default 0.0 on purpose: PrimeXBT does not
+    #: document the unit of the FX `volume` field (EUR/USD 1m bars report a
+    #: median of ~223, which is neither units nor lots), so a participation-based
+    #: impact model here invents costs (or discounts them) at random. The quoted
+    #: bid/ask already contains the real cost of crossing, and the live loop gets
+    #: the authoritative number from the `impact` route (`vwapPriceOffset`).
+    #: Set this only if you know your venue's volume units.
+    slippage_coef: float = 0.0
+    #: Hard ceiling on modelled slippage. The square-root impact law is only
+    #: valid for small participation (order << bar volume); pushing it to
+    #: participation > 1 produces absurd fills (one bug produced +70%). Beyond
+    #: the cap the honest statement is "this size is not tradeable here".
+    max_slippage_bps: float = 2.0
+    #: Optional liquidity guard: refuse sizes above this share of bar volume.
+    #: Off by default because PrimeXBT's FX `volume` unit is not documented and
+    #: the live `impact` route is the authoritative check.
+    max_participation: float = 0.0
     spread_bps_fallback: float = 1.2
     risk_per_trade_pct: float = 0.25
     sl_atr: float = 1.0
@@ -54,6 +70,15 @@ class BacktestConfig:
     max_gross_exposure_pct: float = 300.0
     min_qty: float = 0.0
     qty_step: float = 0.0
+    #: How to resolve a bar that touches BOTH stop and target. Bars are OHLC, so
+    #: the true intrabar path is unknown; guessing silently is how backtests lie.
+    #:   "pessimistic" -- assume the stop was hit first (lower bound)
+    #:   "optimistic"  -- assume the target was hit first (upper bound)
+    #:   "directional" -- infer from the bar's own direction: an up bar is assumed
+    #:                    to travel low->high, so a long's target precedes its stop
+    #: Always report the pessimistic case; the spread between the two is the
+    #: honest uncertainty of an OHLC backtest.
+    intrabar_model: str = "pessimistic"
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -138,6 +163,7 @@ class Backtester:
         cfg = self.config
         times = bars["time"].to_numpy()
         close = bars["close"].to_numpy(dtype=np.float64)
+        open_ = bars["open"].to_numpy(dtype=np.float64) if "open" in bars else close
         high = bars["high"].to_numpy(dtype=np.float64)
         low = bars["low"].to_numpy(dtype=np.float64)
         volume = bars.get("volume", pd.Series(np.ones(len(bars)))).to_numpy(dtype=np.float64)
@@ -172,16 +198,33 @@ class Backtester:
                 exit_price: float | None = None
                 reason = ""
                 side = position["side"]
-                # intrabar stop first (conservative: assume the worst ordering)
-                if side > 0 and lo <= position["stop"]:
+                target = position.get("target") if cfg.tp_atr > 0 else None
+
+                stop_hit = (side > 0 and lo <= position["stop"]) or (
+                    side < 0 and hi >= position["stop"]
+                )
+                target_hit = target is not None and (
+                    (side > 0 and hi >= target) or (side < 0 and lo <= target)
+                )
+
+                if stop_hit and target_hit:
+                    # both levels inside the same bar -> the ordering is a guess
+                    if cfg.intrabar_model == "optimistic":
+                        stop_first = False
+                    elif cfg.intrabar_model == "directional":
+                        up_bar = close[bar_idx] >= open_[bar_idx]
+                        # long in an up bar: low was likely printed before high
+                        stop_first = not (up_bar if side > 0 else not up_bar)
+                    else:  # pessimistic
+                        stop_first = True
+                    if stop_first:
+                        exit_price, reason = position["stop"], "stop"
+                    else:
+                        exit_price, reason = target, "target"
+                elif stop_hit:
                     exit_price, reason = position["stop"], "stop"
-                elif side < 0 and hi >= position["stop"]:
-                    exit_price, reason = position["stop"], "stop"
-                elif cfg.tp_atr > 0 and position.get("target"):
-                    if side > 0 and hi >= position["target"]:
-                        exit_price, reason = position["target"], "target"
-                    elif side < 0 and lo <= position["target"]:
-                        exit_price, reason = position["target"], "target"
+                elif target_hit:
+                    exit_price, reason = target, "target"
                 elif bars_held >= cfg.max_holding_bars:
                     exit_price, reason = close[bar_idx], "time"
                 elif cfg.trailing_stop_atr > 0:
@@ -252,9 +295,16 @@ class Backtester:
                         qty = (qty // cfg.qty_step) * cfg.qty_step
                     if qty <= 0 or qty < cfg.min_qty:
                         qty = 0.0
-                    # sqrt-law slippage
+                    # sqrt-law slippage, capped to a sane band
                     participation = qty / max(volume[entry_bar], 1.0)
-                    slip_bps = cfg.slippage_coef * math.sqrt(max(participation, 0.0)) * 1e4
+                    if cfg.max_participation > 0 and participation > cfg.max_participation:
+                        result.equity_curve.append(equity)
+                        result.timestamps.append(int(times[bar_idx]))
+                        continue
+                    slip_bps = min(
+                        cfg.slippage_coef * math.sqrt(max(participation, 0.0)) * 1e4,
+                        cfg.max_slippage_bps,
+                    )
                     fill = raw_price * (1 + side * slip_bps / 1e4)
                     if qty <= 0:
                         result.equity_curve.append(equity)
