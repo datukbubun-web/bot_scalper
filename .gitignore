@@ -1,0 +1,39 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# artifacts / data
+artifacts/*
+!artifacts/.gitkeep
+data/*
+!data/.gitkeep
+*.onnx
+*.pt
+*.ts
+*.npz
+*.parquet
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# logs & state
+logs/
+*.log
+state/
+runs/
+tensorboard/

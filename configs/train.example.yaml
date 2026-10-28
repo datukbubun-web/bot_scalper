@@ -1,0 +1,41 @@
+# Training configuration (see scripts/training/*.py).
+train:
+  arch: tcn                 # tcn | lstm | transformer
+  symbols: [EUR/USD]
+  bar_size: 1M
+  n_bars: 60000             # ~6 weeks of 1m bars per symbol
+  lookback: 64
+  horizon: 5                # bars ahead for the label
+  dead_band_atr: 0.15
+  epochs: 40
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  patience: 8
+  val_frac: 0.2
+  embargo: 25               # purge gap between train and validation
+  class_balance: true
+
+model:
+  channels: [64, 64, 64, 64]
+  kernel_size: 3
+  dropout: 0.1
+  hidden_size: 64          # lstm/gru
+  patch_len: 8             # transformer
+  d_model: 64
+  n_heads: 4
+  n_layers: 2
+
+rl:
+  algo: ppo                 # ppo | sac
+  total_steps: 200000
+  episode_len: 1440
+  taker_fee_pct: 0.05
+  sl_atr: 1.0
+  tp_atr: 2.0
+  turnover_penalty: 0.02
+  drawdown_penalty: 0.5
+
+export:
+  opset: 17
+  benchmark_iterations: 3000
