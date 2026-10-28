@@ -68,6 +68,11 @@ class FeatureConfig:
     clip_sigma: float = 8.0
     include_time_features: bool = True
     include_quote_features: bool = True
+    #: Attach cross-asset context features (silver, dollar proxies). Requires the
+    #: context bars to be passed to ``transform``; changes n_features, so it is
+    #: recorded in the model manifest and must match at inference time.
+    include_context_features: bool = False
+    context_config: dict = field(default_factory=dict)
     #: Hours (UTC) of the London/NY overlap, where FX liquidity is deepest.
     session_windows: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
@@ -107,6 +112,10 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     "regime": ("skew", "kurtosis", "autocorr_1"),
 }
 
+#: Context columns are generated per symbol label, so they are not in the frozen
+#: FEATURE_NAMES tuple; ``FeatureEngineer`` appends them and freezes the result.
+CONTEXT_GROUP = "context"
+
 #: Columns the model consumes, in a frozen order (bump MODEL_FEATURE_VERSION on change).
 FEATURE_NAMES: tuple[str, ...] = tuple(n for group in FEATURE_GROUPS.values() for n in group)
 MODEL_FEATURE_VERSION = "fx-scalp-1.0.0"
@@ -124,18 +133,37 @@ class FeatureEngineer:
     def __init__(self, config: FeatureConfig | None = None) -> None:
         self.config = config or FeatureConfig()
         self.feature_names: tuple[str, ...] = FEATURE_NAMES
-        self.version = MODEL_FEATURE_VERSION
+        if self.config.include_context_features:
+            from .context import ContextConfig, context_feature_names
+
+            cfg = ContextConfig(**self.config.context_config)
+            # Column order must be identical for training and inference, so the
+            # names come from the config, never from a trial pass over data.
+            self.context_names = context_feature_names(cfg)
+            self.feature_names = FEATURE_NAMES + self.context_names
+            self._context_cfg = cfg
+        else:
+            self.context_names = ()
+            self._context_cfg = None
+        self.version = (
+            MODEL_FEATURE_VERSION if not self.context_names
+            else f"{MODEL_FEATURE_VERSION}+ctx"
+        )
 
     # ------------------------------------------------------------------ public
     @property
     def n_features(self) -> int:
         return len(self.feature_names)
 
-    def transform(self, bars: pd.DataFrame) -> pd.DataFrame:
+    def transform(
+        self, bars: pd.DataFrame, context: dict[str, pd.DataFrame] | None = None
+    ) -> pd.DataFrame:
         """Raw bars -> feature frame (un-normalised), index aligned to ``bars``.
 
         ``bars`` needs columns: ``time, open, high, low, close, volume`` and
         optionally ``bid, ask, bid_size, ask_size`` when quote data is replayed.
+        ``context`` maps symbol -> OHLCV frame of the same bar size and is
+        required when ``include_context_features`` is on.
         """
         df = self._validate(bars)
         cfg = self.config
@@ -244,6 +272,19 @@ class FeatureEngineer:
             _lag1_autocorr, raw=True
         )
 
+        # ------------------------------------------------------ cross-asset
+        if self.context_names:
+            if not context:
+                raise ValueError(
+                    "include_context_features=True but no context frames were passed; "
+                    "call transform(bars, context={symbol: frame})"
+                )
+            from .context import align_context, context_features
+
+            aligned = align_context(df, context)
+            ctx = context_features(aligned, self._context_cfg)
+            out = out.join(ctx)
+
         out = out.reindex(columns=list(self.feature_names))
         return out.replace([np.inf, -np.inf], np.nan)
 
@@ -266,8 +307,10 @@ class FeatureEngineer:
             normalized[col] = z.clip(-cfg.clip_sigma, cfg.clip_sigma) / cfg.clip_sigma * 4.0
         return normalized.fillna(0.0)
 
-    def transform_normalized(self, bars: pd.DataFrame) -> pd.DataFrame:
-        return self.normalize(self.transform(bars))
+    def transform_normalized(
+        self, bars: pd.DataFrame, context: dict[str, pd.DataFrame] | None = None
+    ) -> pd.DataFrame:
+        return self.normalize(self.transform(bars, context=context))
 
     def make_windows(
         self, normalized: pd.DataFrame, lookback: int, drop_warmup: bool = True

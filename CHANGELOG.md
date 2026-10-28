@@ -53,3 +53,33 @@ Rilis pertama: kerangka lengkap, diuji end-to-end.
 - `scripts/training/{ablate_tcn,sweep_tcn,skip_tcn_experiment}.py` — the
   experiments, re-runnable.
 - `tests/test_trainer_integrity.py` — 8 tests pinning the fixes above.
+
+## [Unreleased] — 2026-10-29 (target + context features)
+
+### Added
+- `features/targets.py` — **side-aware triple-barrier target** replacing "sign of
+  the forward return". Classes: 0 = no trade, 1 = short, 2 = long. Barriers scale
+  with ATR, `cost_bps` is subtracted from every winner so an unprofitable barrier
+  is labelled "no trade", and bars touching both barriers are flagged
+  `ambiguous` instead of guessed. Exports `ret_long_bps` **and** `ret_short_bps`
+  so a backtest scores the side the model chose.
+- `features/context.py` — cross-asset features (XAG/USD, USD/CHF, USD/JPY,
+  USD/CAD): return/rel-strength/vol/z/corr/beta/lead-lag per symbol.
+  `FeatureConfig(include_context_features=True)` takes the model from 38 to 74
+  features; column order is config-derived so train/serve match.
+- `scripts/training/eval_targets.py` — evaluates the new target against prior,
+  drift floor, linear probe and TCN, reporting expectancy in bps.
+- `tests/test_targets_and_context.py` — 13 tests.
+
+### Fixed
+- **Context alignment lagged one bar.** `merge_asof` on close times made the
+  context one bar stale, which collapsed the real XAU/XAG return correlation
+  from +0.82 to +0.008 and turned the context features into noise. Now joined on
+  identical bar open time (`lag_bars` available for genuinely late venues).
+- **Evaluation gave every model the oracle's PnL.** Scoring the label's own
+  return instead of the predicted side's return showed a 97% hit rate and
+  +9.8 bps/trade for a constant predictor. Now scores `ret_long_bps` /
+  `ret_short_bps` per predicted class; the same model reads −0.44 bps.
+- `Rolling.cov()` on a DataFrame returns MultiIndex columns and yields all-NaN
+  when sliced, so every context `beta` column had 0% coverage. Rewritten with
+  explicit rolling moments (coverage 89.8–100%).
