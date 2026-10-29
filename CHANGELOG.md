@@ -203,3 +203,24 @@ typo is refused at the terminal instead of at 3 a.m. Tests (14) cover: one-line
 diff, comment preservation, insert-into-block, refused-edit-leaves-file-untouched,
 unknown-field listing, float/bool/tuple coercion, integer settings staying ints,
 and the "2% is four stops" explanation.
+
+### Added — `pxs edge`: a pre-registered search that is allowed to say "no"
+`research/edge_screen.py` tests 41 candidates (24 hour-of-day drifts, 5 day-of-week,
+run continuation/reversal, volume spikes, 20-bar breakouts, z-score reversion,
+outside bars). Results are corrected three ways: Bonferroni over the 41 tests,
+White's Reality Check (block bootstrap of the *maximum* t under the null), and —
+the one that decides — net of the 0.6 bps round trip.
+
+Findings on 200,000 XAU/USD 1M bars: `fade_outside` is **real** (t=+4.45,
+reality-check p=0.005, stable across both halves) at **+0.064 bps**, which is 9x
+too small to pay its own cost. Nothing else clears. Two traps documented: a
+30-minute hold makes "long hour 06" look like t=+12, which collapses to t=+2.47
+once each day counts once; and `fade_outside` stops growing after ~15 minutes,
+the signature of micro-reversion rather than alpha. Lead-lag from USD/JPY,
+USD/CAD, USD/CHF and silver predicts 0.018–0.054 bps — also far below cost.
+
+Tests (8): causal signals (mutating the future cannot change a past signal),
+Bonferroni actually applied, forward returns not scored on the last bar, a
+**positive control** (planted reversal structure must be found) and a **negative
+control** (pure noise must not pass the reality check). `pxs edge` exits 1 when
+nothing clears the hurdle, so it can gate deployment in CI.

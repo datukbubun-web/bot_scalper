@@ -276,6 +276,87 @@ def catalogue(
     )
 
 
+@app.command()
+def edge(
+    symbol: str = typer.Option("XAU/USD", help="symbol to screen"),
+    bars: str = typer.Option("1M", help="bar size: 1M / 5M / 15M"),
+    horizon: int = typer.Option(1, help="hold the signal this many bars"),
+    cost_bps: float = typer.Option(0.6, help="round-trip cost per trade"),
+    top: int = typer.Option(8),
+    reality_check: bool = typer.Option(True, "--reality-check/--no-reality-check"),
+) -> None:
+    """Search for an exploitable edge -- and report honestly when there is none.
+
+    Every candidate is pre-registered, the best one is compared against the
+    distribution of the best-of-N under the null (so luck is not mistaken for
+    alpha), and the result is quoted **net of cost**. A signal that is real but
+    smaller than its own cost is a curiosity, not a strategy.
+    """
+    _bootstrap()
+    import pandas as pd
+
+    from .research.edge_screen import reality_check as rc_fn
+    from .research.edge_screen import screen
+
+    key = symbol.replace("/", "")
+    path = Path(f"data/{key}_{bars}.parquet")
+    if not path.exists():
+        path = Path(f"data/{key}_{bars}.csv.gz")
+    if not path.exists():
+        console.print(f"[red]no cached data at data/{key}_{bars}[/red] -- run `pxs data` first")
+        raise typer.Exit(2)
+
+    df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+    ts = pd.to_datetime(df["time"], unit="ms", utc=True)
+    console.print(
+        f"[bold]{symbol}[/bold] {bars}: {len(df):,} bars "
+        f"({ts.min():%Y-%m-%d} -> {ts.max():%Y-%m-%d}), hold {horizon} bar(s), "
+        f"cost {cost_bps} bps"
+    )
+
+    results = screen(df, horizon=horizon, cost_bps=cost_bps)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("candidate")
+    table.add_column("n", justify="right")
+    table.add_column("gross bps", justify="right")
+    table.add_column("t", justify="right")
+    table.add_column("hit", justify="right")
+    table.add_column("net bps", justify="right")
+    table.add_column("p (Bonf.)", justify="right")
+    for r in results[:top]:
+        table.add_row(
+            r.name,
+            f"{r.n}",
+            f"{r.mean_bps:+.3f}",
+            f"{r.t_stat:+.2f}",
+            f"{r.hit_rate:.1%}",
+            f"[{'green' if r.net_bps > 0 else 'red'}]{r.net_bps:+.3f}[/]",
+            f"{r.p_bonferroni:.3f}",
+        )
+    console.print(table)
+
+    if reality_check:
+        rc = rc_fn(df, horizon=horizon, n_boot=200, block=120)
+        console.print(
+            f"reality check: best t={rc['observed_max_t']:.2f} vs null median "
+            f"{rc['null_max_t_median']:.2f} / p95 {rc['null_max_t_p95']:.2f} -> "
+            f"p={rc['p_value']:.3f}"
+        )
+
+    winners = [r for r in results if r.net_bps > 0]
+    if not winners:
+        best = results[0]
+        console.print(
+            f"[yellow]no candidate beats its cost. Best gross {best.mean_bps:+.3f} bps "
+            f"({best.name}) is {cost_bps / max(best.mean_bps, 1e-9):.0f}x too small for a "
+            f"{cost_bps:.1f} bps round trip.[/yellow]"
+        )
+        raise typer.Exit(1)
+    console.print(f"[green]{len(winners)} candidate(s) clear the cost hurdle[/green]")
+
+
+
+
 risk_app = typer.Typer(add_completion=False, help="Inspect and tune the risk guards.")
 app.add_typer(risk_app, name="risk")
 
