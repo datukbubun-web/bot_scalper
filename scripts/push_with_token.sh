@@ -60,8 +60,14 @@ else
   VERIFIED=0
 fi
 
-# Belt and braces: make sure the token is not sitting in the config.
-git remote set-url origin "$CLEAN_URL"
+# Belt and braces: make sure the token is not sitting in the config. `origin`
+# may not exist at all (a fresh workspace), and `remote set-url` would fail
+# under `set -e` *before* the token file is deleted, leaving the token on disk.
+if git remote get-url origin >/dev/null 2>&1; then
+  git remote set-url origin "$CLEAN_URL"
+else
+  git remote add origin "$CLEAN_URL"
+fi
 if git config --get-regexp '^remote\.origin\.' | grep -q "@github.com"; then
   echo "WARNING: token still present in remote config -- cleaning" >&2
   git remote set-url origin "$CLEAN_URL"
