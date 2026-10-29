@@ -184,3 +184,50 @@ def test_mini100_sizes_a_position_within_the_leverage_cap():
     assert verdict.qty > 0
     assert notional <= 100.0 * 10.0 + 1e-6      # leverage cap holds
     assert verdict.stop_loss is not None and verdict.take_profit is not None
+
+
+# ── configuration paths (YAML + environment) ────────────────────────────────
+def test_string_values_from_env_or_yaml_are_coerced():
+    """A settings typo must not silently produce a wrong guard."""
+    cfg = RiskConfig.from_dict({
+        "max_intraday_loss_pct": "2.0",
+        "max_daily_trades": "8",
+        "blackout_enabled": "false",
+        "blackout_kinds": "nfp, cpi",
+        "blackout_pre_min": "30",
+    })
+    assert cfg.max_intraday_loss_pct == pytest.approx(2.0)
+    assert cfg.max_daily_trades == 8
+    assert cfg.blackout_enabled is False
+    assert cfg.blackout_kinds == ("nfp", "cpi")
+    assert cfg.blackout_pre_min == pytest.approx(30.0)
+
+
+def test_env_overrides_the_yaml(monkeypatch):
+    """Ops must be able to tighten a guard without editing the committed file."""
+    monkeypatch.setenv("PX_RISK_MAX_INTRADAY_LOSS_PCT", "2.0")
+    monkeypatch.setenv("PX_RISK_BLACKOUT_PRE_MIN", "30")
+    cfg = RiskConfig.from_dict({"max_intraday_loss_pct": 0.75})
+    assert cfg.max_intraday_loss_pct == pytest.approx(2.0)
+    assert cfg.blackout_pre_min == pytest.approx(30.0)
+    # and it can be switched off for tests / backtests
+    assert RiskConfig.from_dict({}, allow_env=False).max_intraday_loss_pct == 0.75
+
+
+def test_unknown_env_override_is_ignored_not_crashed(monkeypatch):
+    monkeypatch.setenv("PX_RISK_NOT_A_REAL_FIELD", "1")
+    assert RiskConfig.from_dict({}).max_intraday_loss_pct == 0.75
+
+
+def test_intraday_brake_is_above_a_single_stop_at_mini_size():
+    """The whole point of raising it: one stop + slippage must not trip the
+    brake, or the bot stops after every normal loss and the operator is
+    tempted to raise risk to 'recover'."""
+    raw = yaml.safe_load(open("configs/live.mini100.yaml"))
+    risk = RiskConfig.from_dict(raw["risk"], allow_env=False)
+    one_stop_pct = risk.risk_per_trade_pct * risk.sl_atr / risk.sl_atr  # 0.5% at 1.0xATR
+    assert risk.max_intraday_loss_pct >= 3 * one_stop_pct, (
+        f"brake {risk.max_intraday_loss_pct}% is less than 3 stops "
+        f"({3 * one_stop_pct}%) -- one bad bar would halt the bot"
+    )
+    assert risk.max_total_loss_pct > risk.max_intraday_loss_pct

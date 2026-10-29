@@ -87,3 +87,61 @@ menambah kebocoran di atas biaya yang sudah dihitung.
    biaya. Selisihnya = biaya eksekusi nyata Anda.
 2. Baru setelah itu, mulai dengan **$100 penuh tapi risiko 0.5%** — bukan dinaikkan.
 3. Berhenti pada −10%. Titik. Jangan menambah deposit untuk "menyelamatkan" akun.
+
+## 7. Mengubah angka ini: YAML atau environment
+
+Dua jalur resmi, keduanya diuji.
+
+**A. Edit YAML** (disarankan — riwayatnya ikut ter-commit):
+
+```yaml
+risk:
+  max_intraday_loss_pct: 2.0    # rem intraday; 0 = matikan
+  max_total_loss_pct: 10.0      # batas keras, mengunci kill switch
+```
+
+**B. Environment variable** untuk koreksi cepat tanpa deploy:
+
+```bash
+export PX_RISK_MAX_INTRADAY_LOSS_PCT=2.0
+export PX_RISK_MAX_TOTAL_LOSS_PCT=10
+export PX_RISK_BLACKOUT_PRE_MIN=30
+export PX_RISK_BLACKOUT_ENABLED=false
+```
+
+Aturannya:
+
+| Hal | Perilaku |
+|---|---|
+| Nama variabel | `PX_RISK_` + nama field, huruf besar |
+| Prioritas | env **menimpa** YAML |
+| Field tak dikenal | diabaikan + warning (tidak crash) |
+| Nilai string ("2.0", "true", "nfp,cpi") | dikonversi ke tipe yang benar |
+| Override aktif | selalu di-*log* (`risk config overridden from environment: [...]`) |
+| Untuk backtest/uji | `RiskConfig.from_dict(raw, allow_env=False)` |
+
+Contoh nyata dari engine:
+
+```
+YAML saja      : 2.0
+YAML + env 5   : 5.0
+allow_env=False: 2.0
+```
+
+Kenapa di-*log*: guard yang berbeda dari konfigurasi yang di-commit harus
+terlihat. Diam-diam longgar adalah cara paling mudah kehilangan akun.
+
+### Satu jebakan: `dry_run` di YAML tidak berpengaruh
+
+`live_runner.py` menetapkan `dry_run = not allow_live`, dan `allow_live` hanya
+`true` bila **kedua** syarat ini terpenuhi: `PX_LIVE_TRADING=1` **dan** flag
+`--i-understand-the-risk`. Jadi `dry_run: true` di YAML adalah dokumentasi niat,
+bukan saklar — mode nyata ditentukan oleh env + flag CLI:
+
+```bash
+# paper (default, aman)
+pxs trade --config configs/live.mini100.yaml
+
+# uang sungguhan — hanya setelah paham §5 dan §6
+PX_LIVE_TRADING=1 pxs trade --config configs/live.mini100.yaml --i-understand-the-risk
+```

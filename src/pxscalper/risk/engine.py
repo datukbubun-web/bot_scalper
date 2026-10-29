@@ -43,7 +43,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, get_origin, get_type_hints
 
 __all__ = [
     "RiskConfig",
@@ -131,13 +131,67 @@ class RiskConfig:
     state_path: str = "state/risk_state.json"
     kill_switch_path: str = "state/KILL"
 
+    # Resolved once at import: with `from __future__ import annotations` the
+    # dataclass field types are strings, so coercion needs the real classes.
+    _field_types: ClassVar[dict[str, Any]] = {}
+
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "RiskConfig":
+    def from_dict(cls, raw: dict[str, Any], *, allow_env: bool = True) -> "RiskConfig":
         valid = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
         for key in ("trading_hours",):
             if key in valid:
                 valid[key] = {k: tuple(v) for k, v in valid[key].items()}
+        valid = cls._coerce(valid)
+        if allow_env:
+            valid.update(cls._coerce(cls._env_overrides()))
         return cls(**valid)
+
+    @classmethod
+    def _coerce(cls, raw: dict[str, Any]) -> dict[str, Any]:
+        """Turn strings ("15", "true", "nfp,cpi") into the declared field types.
+
+        Values arrive as strings from env vars, from some YAML parsers and from
+        human typos. Coercing in one place means a typo fails loudly here
+        instead of producing a silently wrong guard.
+        """
+        out = dict(raw)
+        for key, value in raw.items():
+            if not isinstance(value, str):
+                continue
+            hint = cls._field_types.get(key)
+            origin = get_origin(hint) or hint
+            text = value.strip()
+            if origin in (int, float) and text:
+                out[key] = origin(float(text))
+            elif origin is bool:
+                out[key] = text.lower() in ("1", "true", "yes", "on")
+            elif origin in (tuple, list):
+                items = tuple(p.strip() for p in text.split(",") if p.strip())
+                out[key] = items if origin is tuple else list(items)
+        return out
+
+    @classmethod
+    def _env_overrides(cls) -> dict[str, Any]:
+        """``PX_RISK_<FIELD>=value`` overrides the YAML, for ops without a deploy.
+
+        Deliberately narrow: only fields that exist on RiskConfig, and every
+        value goes through the same coercion as the YAML. An override is logged,
+        because a guard that differs from the committed config must not be
+        invisible.
+        """
+        out: dict[str, Any] = {}
+        prefix = "PX_RISK_"
+        for name, value in os.environ.items():
+            if not name.startswith(prefix):
+                continue
+            key = name[len(prefix):].lower()
+            if key not in cls.__dataclass_fields__:
+                log.warning("ignoring unknown risk override %s", name)
+                continue
+            out[key] = value
+        if out:
+            log.warning("risk config overridden from environment: %s", sorted(out))
+        return out
 
 
 @dataclass
@@ -616,3 +670,15 @@ class RiskEngine:
             "state": self.state.to_dict(),
             "kill_engaged": self.kill.engaged(),
         }
+
+
+# ---------------------------------------------------------------- type resolver
+def _resolve_risk_field_types() -> None:
+    hints = get_type_hints(RiskConfig)
+    RiskConfig._field_types = {name: hints.get(name) for name in RiskConfig.__dataclass_fields__}
+
+
+try:  # pragma: no cover - import-time wiring
+    _resolve_risk_field_types()
+except Exception as _exc:  # noqa: BLE001 - never break import over a convenience
+    log.warning("risk config type resolution skipped: %s", _exc)
