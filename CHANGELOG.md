@@ -224,3 +224,23 @@ Bonferroni actually applied, forward returns not scored on the last bar, a
 **positive control** (planted reversal structure must be found) and a **negative
 control** (pure noise must not pass the reality check). `pxs edge` exits 1 when
 nothing clears the hurdle, so it can gate deployment in CI.
+
+### Investigated — "just add a model that predicts direction from 38 features"
+Retrained the shipped TCN on 45,000 XAU/USD 1M bars and ran a cheaper direct
+test (logistic regression on equivalent features, 162k bars, chronological
+split). Findings, all reproducible:
+
+- TCN: best `val_loss` 1.1040 vs class-frequency baseline 1.0478 — it does not
+  beat the baseline, and `--fail-if-no-edge` refuses it. `val_loss` rises from
+  epoch 1 to 7 while train accuracy improves: textbook overfitting.
+- Logistic: OOS accuracy **0.4205** vs baseline 0.4182 (+0.24 points), direction
+  accuracy 0.5159. Break-even needs **0.5440**. Largest learned weight: 0.028.
+- Break-even accuracy computed from real label statistics: 54.4% (wins average
+  +6.26 bps, losses −7.46 bps after 0.6 bps cost).
+- **Positive control**: same code recovers planted signal at 0.843 and 0.654
+  accuracy, degrading to noise as the signal weakens. So the model is not blind
+  — the data has nothing to learn at this timescale/cost.
+
+docs/DIRECTION_MODEL_REPORT.md records it, including what would have to change
+first: target (triple-barrier, not direction), a base signal that passes the
+cost gate, 6–12 months of data instead of 31 days, and a longer hold.
