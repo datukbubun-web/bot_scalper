@@ -269,3 +269,85 @@ def cost_hurdle_table(horizons=(1, 3, 5, 15)) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+# ------------------------------------------------- does the edge scale with it?
+def conditional_edge(
+    df: pd.DataFrame,
+    horizon: int = 1,
+    cost_bps: float = 0.6,
+    buckets: tuple[tuple[float, float], ...] = (
+        (1.0, 1.2), (1.2, 1.5), (1.5, 2.0), (2.0, 3.0), (3.0, float("inf")),
+    ),
+) -> pd.DataFrame:
+    """Does `fade_outside` earn more on more extreme bars?
+
+    This is the question that decides whether a model can help. If the edge is
+    flat across signal strength, selection adds nothing and a model is
+    decoration. If it grows, selection has something to work with -- but the
+    result still has to clear the cost, which is the harder test.
+
+    t is computed per DAY, not per bar: bars inside a multi-bar hold overlap,
+    and counting each one inflates t by 2-4x (seen: +12.0 vs +2.47).
+    """
+    close = df["close"]
+    fwd = forward_return_bps(df, horizon)
+    rng = df["high"] - df["low"]
+    ratio = (rng / rng.rolling(20).mean().shift(1)).to_numpy()
+    bar_dir = np.sign(close.diff()).to_numpy()
+    signal = np.where(np.isfinite(ratio), -bar_dir, 0.0)
+    pnl = signal * fwd
+
+    if "time" in df.columns:
+        day = pd.to_datetime(df["time"], unit="ms", utc=True).dt.date.to_numpy()
+    else:
+        day = np.arange(len(df)) // 1440
+
+    rows = []
+    for lo, hi in buckets:
+        mask = np.isfinite(pnl) & (ratio >= lo) & (ratio < hi)
+        n = int(mask.sum())
+        if n < 300:
+            continue
+        per_day = pd.DataFrame({"day": day[mask], "p": pnl[mask]}).groupby("day")["p"].mean()
+        sd = float(per_day.std(ddof=1))
+        t = float(per_day.mean() / (sd / np.sqrt(len(per_day)))) if sd > 0 else 0.0
+        rows.append(
+            {
+                "range_x_avg": f"{lo:g}-{hi if np.isfinite(hi) else 'inf'}",
+                "n": n,
+                "trades_per_day": round(n / max(len(per_day), 1), 1),
+                "days": len(per_day),
+                "gross_bps": float(pnl[mask].mean()),
+                "t_per_day": t,
+                "net_bps": float(pnl[mask].mean()) - cost_bps,
+                "hit_rate": float((pnl[mask] > 0).mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def pnl_concentration(df: pd.DataFrame, top_n: int = 10, horizon: int = 1) -> dict:
+    """How much of the result comes from a handful of days?
+
+    A real edge shows up across many days. An edge that lives in 10 days out of
+    174 is a handful of lucky afternoons, and it will not repeat.
+    """
+    close = df["close"]
+    fwd = forward_return_bps(df, horizon)
+    rng = df["high"] - df["low"]
+    ratio = (rng / rng.rolling(20).mean().shift(1)).to_numpy()
+    signal = np.where(np.isfinite(ratio) & (ratio >= 3.0), -np.sign(close.diff()).to_numpy(), 0.0)
+    pnl = signal * fwd
+    mask = np.isfinite(pnl) & (signal != 0)
+    day = pd.to_datetime(df["time"], unit="ms", utc=True).dt.date.to_numpy()
+    per_day = pd.DataFrame({"day": day[mask], "p": pnl[mask]}).groupby("day")["p"].mean()
+    total = float(per_day.sum())
+    best = float(per_day.nlargest(top_n).sum())
+    return {
+        "days": len(per_day),
+        "mean_bps_per_day": float(per_day.mean()),
+        "positive_day_share": float((per_day > 0).mean()),
+        "top_days_share_of_total": best / total if total else float("nan"),
+        "mean_without_top_days": (total - best) / len(per_day),
+    }
