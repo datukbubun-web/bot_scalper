@@ -110,6 +110,7 @@ def main() -> int:
     ap.add_argument("--cost-bps", type=float, default=0.6,
                     help="round-trip cost: XAU/USD live spread 0.49 bps + fees")
     ap.add_argument("--with-context", action="store_true", help="add cross-asset features")
+    ap.add_argument("--with-calendar", action="store_true", help="add macro calendar features")
     ap.add_argument("--with-tcn", action="store_true", help="also train a TCN")
     ap.add_argument("--out", default="artifacts/targets")
     args = ap.parse_args()
@@ -133,7 +134,8 @@ def main() -> int:
     print(json.dumps(stats, indent=2))
 
     # features
-    fcfg = FeatureConfig(include_context_features=args.with_context)
+    fcfg = FeatureConfig(include_context_features=args.with_context,
+                         include_calendar_features=args.with_calendar)
     engineer = FeatureEngineer(fcfg)
     context = load_context(paths, args.symbol, args.bars, args.n_bars) if args.with_context else None
     if context:
@@ -213,7 +215,7 @@ def main() -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{args.symbol.replace('/', '')}_{args.bars}_h{args.horizon}" + (
-        "_ctx" if args.with_context else "")
+        "_ctx" if args.with_context else "") + ("_cal" if args.with_calendar else "")
     (out_dir / f"{tag}.json").write_text(json.dumps(
         {"symbol": args.symbol, "bars": args.bars, "horizon": args.horizon,
          "config": bcfg.__dict__, "target_stats": stats, "features": features.shape[1],

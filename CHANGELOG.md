@@ -83,3 +83,39 @@ Rilis pertama: kerangka lengkap, diuji end-to-end.
 - `Rolling.cov()` on a DataFrame returns MultiIndex columns and yields all-NaN
   when sliced, so every context `beta` column had 0% coverage. Rewritten with
   explicit rolling moments (coverage 89.8–100%).
+
+## [Unreleased] — 2026-10-29 (macro calendar)
+
+### Added
+- `features/calendar.py` — scheduled macro-release features for **NFP, CPI and
+  FOMC**. Uses only the *schedule* (published months ahead), never the content,
+  so it is not look-ahead. Times are converted from US/Eastern with `zoneinfo`,
+  so DST is handled (CPI 14 Oct → 12:30 UTC, 10 Nov → 13:30 UTC).
+  `BUILTIN_SCHEDULE` holds the 32 official 2026 dates with sources in
+  `SCHEDULE_SOURCES`; `MacroCalendar.from_csv` for future years.
+  Columns: `cal_<kind>_mins_to`, `_mins_since`, `_pre_15/_pre_60`,
+  `_post_15/_post_60`, `_is_day`, plus `cal_any_mins_to`/`cal_any_pre_min`.
+  `FeatureConfig(include_calendar_features=True)`: 38 → 61 features.
+- `scripts/training/eval_calendar.py` — tests the calendar where it can actually
+  help: regime volatility, per-side expectancy, and the sample size a claim
+  would need.
+- `tests/test_calendar.py` — 14 tests.
+
+### Fixed
+- **Normalisation silently erased every calendar flag.** A binary flag is 1 on a
+  handful of bars out of a 500-bar window, so its rolling MAD is 0, the robust
+  z-score becomes NaN and `fillna(0.0)` replaced it — the column existed, looked
+  populated, and was entirely zero. `cal_*` columns now pass through unscaled.
+- Post-event windows were one bar too wide (`<=` should be `<`): a "15-minute
+  window" spanned 16 minutes.
+- `BUILTIN_SCHEDULE` is now sorted by instant; an unsorted schedule is a
+  landmine for anything that walks it.
+
+### Findings (docs/CALENDAR_REPORT.md)
+- Volatility around releases is **9.43×** normal for pre-NFP, 5.18× CPI, 5.33×
+  FOMC (p < 0.0001), and the median 5m bar range goes 8.79 → 26.10 bps.
+- Directional expectancy is unchanged inside those windows, and adding the
+  features makes classification slightly worse. The calendar predicts *when*,
+  not *which way*.
+- Publishing that honestly needs power analysis, not intuition: the attractive
+  cells need 112–5,279 days of data and we have 101.

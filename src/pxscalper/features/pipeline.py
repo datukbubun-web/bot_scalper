@@ -73,6 +73,11 @@ class FeatureConfig:
     #: recorded in the model manifest and must match at inference time.
     include_context_features: bool = False
     context_config: dict = field(default_factory=dict)
+    #: Attach scheduled macro-release features (NFP / CPI / FOMC). Only the
+    #: *schedule* is used -- release times are public months ahead, the content
+    #: is never touched, so this is not look-ahead.
+    include_calendar_features: bool = False
+    calendar_config: dict = field(default_factory=dict)
     #: Hours (UTC) of the London/NY overlap, where FX liquidity is deepest.
     session_windows: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
@@ -145,10 +150,20 @@ class FeatureEngineer:
         else:
             self.context_names = ()
             self._context_cfg = None
-        self.version = (
-            MODEL_FEATURE_VERSION if not self.context_names
-            else f"{MODEL_FEATURE_VERSION}+ctx"
-        )
+
+        if self.config.include_calendar_features:
+            from .calendar import CalendarConfig, calendar_feature_names
+
+            self._calendar_cfg = CalendarConfig(**self.config.calendar_config)
+            self.calendar_names = calendar_feature_names(self._calendar_cfg)
+            self.feature_names = tuple(self.feature_names) + self.calendar_names
+        else:
+            self.calendar_names = ()
+            self._calendar_cfg = None
+
+        suffix = ("+ctx" if self.context_names else "") + (
+            "+cal" if self.calendar_names else "")
+        self.version = f"{MODEL_FEATURE_VERSION}{suffix}"
 
     # ------------------------------------------------------------------ public
     @property
@@ -285,6 +300,14 @@ class FeatureEngineer:
             ctx = context_features(aligned, self._context_cfg)
             out = out.join(ctx)
 
+        # ------------------------------------------------ macro schedule
+        if getattr(self, "calendar_names", ()):
+            from .calendar import calendar_features
+
+            cal = calendar_features(df["time"].to_numpy(), config=self._calendar_cfg)
+            cal.index = out.index
+            out = out.join(cal)
+
         out = out.reindex(columns=list(self.feature_names))
         return out.replace([np.inf, -np.inf], np.nan)
 
@@ -294,9 +317,20 @@ class FeatureEngineer:
         normalized = pd.DataFrame(index=features.index)
         for col in features.columns:
             series = features[col]
-            if col.startswith("sess_") or col in {
-                "hour_sin", "hour_cos", "minute_sin", "minute_cos", "dow_sin", "dow_cos",
-            }:
+            if (
+                col.startswith("sess_")
+                or col.startswith("cal_")     # see below
+                or col in {
+                    "hour_sin", "hour_cos", "minute_sin", "minute_cos", "dow_sin", "dow_cos",
+                }
+            ):
+                # Already bounded and stationary; pass through unscaled.
+                #
+                # Calendar columns MUST bypass the robust z-score. A binary flag
+                # is 1 on a handful of bars out of a 500-bar window, so its
+                # rolling MAD is 0, the z-score becomes NaN and ``fillna(0.0)``
+                # silently deletes the feature -- the model would never see a
+                # release, while the column still existed and looked fine.
                 normalized[col] = series.fillna(0.0)
                 continue
             median = series.rolling(cfg.norm_window, min_periods=cfg.norm_min_periods).median()
