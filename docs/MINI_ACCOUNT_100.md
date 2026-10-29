@@ -239,3 +239,72 @@ XAU/USD. Konfigurasi yang menyebut satu instrumen menjalankan instrumen lain.
 Sudah diperbaiki: kedua tata letak dibaca (level teratas diutamakan), dan config
 tanpa `symbols` sekarang **gagal keras** alih-alih diam-diam memakai EUR/USD.
 Ada tes regresi khusus untuk ini.
+
+
+## 10. Target profit gabungan: tutup semua posisi
+
+Anda minta: begitu profit gabungan mencapai $3, bot menutup **semua** posisi —
+termasuk yang masih rugi. Ini yang dipasang:
+
+```yaml
+close_all_on_profit: 3.0      # USD; 0 = mati
+close_all_enforce: true       # true = benar-benar menutup; false = hanya lapor
+close_all_cooldown_s: 300     # jeda setelah flat sebelum bisa memicu lagi
+```
+
+Ubah tanpa edit file:
+
+```bash
+pxs risk set close_all_on_profit=5
+pxs risk set close_all_on_profit=3 close_all_enforce=false   # mode lapor saja
+pxs risk show | grep close_all
+```
+
+Perilaku yang sudah diuji:
+
+| Situasi | Total | Aksi |
+|---|---|---|
+| 3 posisi baru buka | $0.00 | tahan |
+| 2 untung, 2 rugi | −$0.20 | tahan |
+| hampir | +$2.40 | tahan |
+| **tepat target** | **+$3.00** | **TUTUP SEMUA** |
+| 2 untung, 6 rugi | +$3.20 | **TUTUP SEMUA** |
+
+Keputusan desain yang perlu Anda tahu:
+
+1. **Dicek setiap siklus loop, bukan per bar.** Profit memuncak di antara bar
+   close; menunggu bar close adalah cara paling umum kehilangan target yang
+   sudah tercapai.
+2. **Ditutup satu per satu**, bukan pakai endpoint `close/all` venue, supaya
+   setiap penutupan punya catatan audit — terutama posisi yang masih rugi, yang
+   nanti perlu dijelaskan.
+3. **Kalau satu penutupan gagal, target tidak dianggap selesai.** Bot akan coba
+   lagi. Satu error API tidak boleh mematikan aturan ini diam-diam.
+4. **Cooldown 300 detik** setelah flat, kalau tidak bot akan menutup posisi
+   pertama siklus berikutnya begitu muncul profit satu sen.
+5. **Bentuk data tak dikenal → error, bukan $0.00.** Total basket yang diam-diam
+   mengabaikan satu posisi lebih berbahaya daripada tidak ada aturan.
+
+### Dan satu masalah lagi yang ketemu di sini
+
+Anda minta 10 posisi, dan tesnya menunjukkan **10 posisi tidak akan pernah
+terbuka**: plafon eksposur $1.000 seluruhnya dipakai oleh order pertama, jadi
+order kedua langsung ditolak. Aturannya "boleh 10" tapi kenyataannya 1.
+
+Sudah diperbaiki dengan `split_exposure_across_slots: true` — plafon dibagi ke
+slot yang tersisa. Hasil nyata:
+
+```
+posisi  1: 0.02 oz ($ 81) | total $  81
+posisi  5: 0.02 oz ($ 81) | total $407
+posisi 10: 0.03 oz ($122) | total $976   <- masih di bawah plafon $1.000
+posisi 11: BLOCK - max positions (10) reached
+```
+
+### Peringatan yang tetap berlaku
+
+10 entry searah di XAU/USD bisa **kena stop bersamaan**, jadi kerugian totalnya
+sampai 10x satu stop. Dalam preset ini: satu stop ≈ $0.50, jadi 10 stop ≈ $5 —
+separuh dari batas harian 3% ($3), dan masih jauh dari `max_total_loss_pct` 10%
+($10). Yang menahan bukan target profitnya, tapi rem intraday 2% dan batas total
+10% itu.
