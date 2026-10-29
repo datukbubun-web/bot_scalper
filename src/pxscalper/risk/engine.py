@@ -57,6 +57,11 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 
+def _iso(ms: float) -> str:
+    """UTC timestamp for log/verdict messages (never used for logic)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000.0))
+
+
 class RiskDecision(str, Enum):
     ALLOW = "ALLOW"
     ALLOW_REDUCED = "ALLOW_REDUCED"
@@ -91,6 +96,27 @@ class RiskConfig:
     max_daily_trades: int = 60
     consecutive_loss_cooldown: int = 3
     cooldown_minutes: int = 30
+    # ---- scheduled-event blackout -------------------------------------------
+    # Macro releases make a 1-minute bar ~22x wider than normal (measured on
+    # XAU/USD: 87.21 bps vs 3.96). A stop sized from pre-event ATR sits inside
+    # the noise, so the bot stops opening trades around a release and resumes by
+    # itself afterwards. Nothing is closed: this gates ENTRY only.
+    blackout_enabled: bool = True
+    blackout_pre_min: float = 15.0        # minutes before the release
+    blackout_post_min: float = 15.0       # minutes after the release
+    blackout_kinds: tuple[str, ...] = ("nfp", "cpi", "fomc")
+    # optional explicit override: [(start_ms, end_ms), ...] merged with the calendar
+    blackout_windows: list[tuple[int, int]] = field(default_factory=list)
+
+    # ---- lifetime capital guards --------------------------------------------
+    # A daily brake is useless if the account dies in a week. For a small account
+    # the total drawdown limit is the one that actually protects the capital, so
+    # it is checked first and it latches the kill switch.
+    max_total_loss_pct: float = 15.0       # from the initial deposit; 0 disables
+    # Refuse to trade an account so small that one qty step exceeds the risk
+    # budget -- at that size the "risk per trade" setting is a fiction.
+    min_equity: float = 0.0
+
     # micro-filters
     max_spread_bps: float = 3.0
     min_atr_bps: float = 0.8               # volatility floor (dead market)
@@ -124,6 +150,7 @@ class RiskState:
     realised_pnl_today: float = 0.0
     trades_today: int = 0
     peak_equity: float = 0.0
+    initial_equity: float = 0.0
     consecutive_losses: int = 0
     cooldown_until_ms: int = 0
     last_trade_ms: int = 0
@@ -260,6 +287,42 @@ class RiskEngine:
             self.state.day_start_equity = equity
         if self.state.intraday_peak_equity <= 0:
             self.state.intraday_peak_equity = equity
+        # The first equity we ever see is the deposit this account was funded
+        # with; total-loss limits are measured from here, not from a rolling peak.
+        if self.state.initial_equity <= 0:
+            self.state.initial_equity = equity
+
+    # -------------------------------------------------------------- blackout
+    def blackout_status(self, now_ms: int) -> tuple[bool, str, float]:
+        """Is trading blacked out right now, and for how much longer?
+
+        Combines the macro calendar (known months in advance) with any explicit
+        windows from the config. Returns ``(blocked, reason, seconds_left)``.
+        Empty/disabled config returns ``(False, "", 0.0)``.
+        """
+        cfg = self.config
+        if not cfg.blackout_enabled:
+            return False, "", 0.0
+
+        windows: list[tuple[int, int]] = [(int(a), int(b)) for a, b in cfg.blackout_windows]
+        if cfg.blackout_kinds:
+            try:
+                from ..features.calendar import MacroCalendar
+
+                cal = MacroCalendar()
+                pre = int(cfg.blackout_pre_min * 60_000)
+                post = int(cfg.blackout_post_min * 60_000)
+                for kind in cfg.blackout_kinds:
+                    for ev in cal.times(kind):
+                        windows.append((int(ev) - pre, int(ev) + post))
+            except Exception as exc:  # noqa: BLE001 - calendar must never kill the loop
+                log.warning("blackout calendar unavailable (%s); using explicit windows only", exc)
+
+        for start, end in windows:
+            if start <= now_ms < end:
+                left = (end - now_ms) / 1000.0
+                return True, f"macro blackout until {_iso(end)}", left
+        return False, "", 0.0
 
     def on_trade_closed(self, pnl: float) -> None:
         self.state.realised_pnl_today += pnl
@@ -325,6 +388,36 @@ class RiskEngine:
             )
 
         # 1. kill switch -------------------------------------------------------
+        # 0. lifetime capital guard ------------------------------------------
+        # Checked before everything: on a small account the total-loss limit is
+        # the guard that actually keeps the capital alive, and once breached it
+        # latches the kill switch rather than pausing.
+        if cfg.max_total_loss_pct > 0 and self.state.initial_equity > 0:
+            total_loss_pct = (self.state.initial_equity - equity) / self.state.initial_equity * 100
+            details["total_loss_pct"] = total_loss_pct
+            details["initial_equity"] = self.state.initial_equity
+            checks["total_loss_ok"] = total_loss_pct < cfg.max_total_loss_pct
+            if not checks["total_loss_ok"]:
+                self.kill.engage(
+                    f"total loss {total_loss_pct:.2f}% >= {cfg.max_total_loss_pct}% "
+                    f"(initial {self.state.initial_equity:.2f})"
+                )
+                return verdict(
+                    RiskDecision.BLOCK,
+                    f"TOTAL LOSS LIMIT: down {total_loss_pct:.2f}% from an initial "
+                    f"{self.state.initial_equity:.2f} (limit {cfg.max_total_loss_pct}%) "
+                    f"-> kill switch engaged, manual review required",
+                )
+
+        # 0b. account minimum -------------------------------------------------
+        if cfg.min_equity > 0:
+            checks["min_equity_ok"] = equity >= cfg.min_equity
+            if not checks["min_equity_ok"]:
+                return verdict(
+                    RiskDecision.BLOCK,
+                    f"equity {equity:.2f} below the configured minimum {cfg.min_equity:.2f}",
+                )
+
         checks["kill_switch"] = not self.kill.engaged()
         if not checks["kill_switch"]:
             return verdict(RiskDecision.BLOCK, "kill switch engaged")
@@ -342,6 +435,19 @@ class RiskEngine:
             return verdict(RiskDecision.FLAT, "market closed / outside trading hours")
 
         # 4. spread ------------------------------------------------------------
+        # 3b. scheduled-event blackout ---------------------------------------
+        if cfg.blackout_enabled:
+            clock_ms = int((now_ms if now_ms is not None else self._clock() * 1000))
+            blocked, why, seconds_left = self.blackout_status(clock_ms)
+            checks["no_blackout"] = not blocked
+            details["blackout_seconds_left"] = seconds_left
+            if blocked:
+                return verdict(
+                    RiskDecision.FLAT,
+                    f"{why} ({seconds_left / 60:.0f} min left) -> entry paused, "
+                    f"resumes automatically",
+                )
+
         checks["spread_ok"] = spread_bps <= cfg.max_spread_bps
         if not checks["spread_ok"]:
             return verdict(RiskDecision.FLAT, f"spread {spread_bps:.2f}bps > {cfg.max_spread_bps}bps")

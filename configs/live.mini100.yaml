@@ -1,0 +1,78 @@
+# Preset: akun mini $100 — XAU/USD, safety-first.
+#
+# Angka di file ini bukan pilihan selera. Setiap nilai punya alasan yang bisa
+# diperiksa ulang dengan `pxs catalogue` dan hasil uji di docs/.
+#
+# Kenyataan akun $100 di venue ini (diukur, bukan diperkirakan):
+#   XAU/USD : 1 qtyStep = 0.01 oz ≈ $40.67 notional, spread 0.49 bps
+#   Slippage order 100 oz ($407k): 0 — jadi ukuran kita tidak akan menggerakkan harga
+#   Biaya spread pada posisi $500: $0.025 (0.025% akun) — sangat kecil
+#   ATR 1M ≈ 3.5 bps -> stop 1.0xATR = 3.5 bps
+#
+# Yang TIDAK dilakukan file ini: membuat bot ini menguntungkan. Hasil uji pada
+# 204 hari data nyata: tidak ada edge arah (edge terukur negatif). Konfigurasi ini
+# dirancang untuk MEMBATASI kerugian, bukan untuk menghasilkan profit.
+
+symbols: ["XAU/USD"]
+bar_size: "5M"
+lookback: 64
+horizon: 5
+
+inference:
+  backend: "onnx"
+  confidence_threshold: 0.45
+  edge_threshold: 0.03
+
+strategy:
+  kind: "probabilistic"
+  min_confidence: 0.45
+  min_edge: 0.03
+  allow_flat: true
+  size_by_edge: false
+
+risk:
+  # ---- sizing: kecil, karena tujuan utamanya bukan profit ---------------
+  risk_per_trade_pct: 0.5        # $0.50 per trade pada akun $100
+  max_leverage: 10.0             # $100 -> posisi maksimum $1,000
+  max_positions: 1               # satu posisi; modal mini tidak boleh dibagi
+  max_gross_exposure_pct: 1000.0 # konsisten dengan max_leverage
+  sl_atr: 1.0
+  tp_atr: 1.5
+  max_holding_bars: 12
+
+  # ---- guards: ini yang sesungguhnya melindungi $100 --------------------
+  max_total_loss_pct: 10.0       # -$10 dari deposit -> KILL, berhenti permanen
+  max_daily_loss_pct: 3.0
+  max_intraday_loss_pct: 2.0
+  max_drawdown_pct: 8.0
+  max_daily_trades: 8            # 8 trade x biaya kecil; hindari churn
+  consecutive_loss_cooldown: 3
+  cooldown_minutes: 60
+  min_equity: 60.0               # di bawah $60 berhenti: step sudah tidak muat
+
+  # ---- blackout rilis makro --------------------------------------------
+  blackout_enabled: true
+  blackout_pre_min: 15
+  blackout_post_min: 15
+  blackout_kinds: ["nfp", "cpi", "fomc"]
+
+  # ---- micro-filters ----------------------------------------------------
+  max_spread_bps: 1.5            # XAU/USD normalnya 0.49; 1.5 = pasar kacau
+  min_atr_bps: 1.5               # pasar mati -> tidak ada yang bisa diperas
+  max_atr_bps: 15.0              # volatilitas ekstrem -> jangan masuk
+  min_confidence: 0.45
+  min_edge: 0.03
+
+  max_daily_loss_stop: true
+  allow_hedging: false
+
+execution:
+  order_type: "market"
+  max_slippage_bps: 3.0
+  reconcile_interval_s: 30
+  dry_run: true                  # WAJIB tetap true sampai Anda sadar risikonya
+
+monitoring:
+  log_dir: "logs"
+  journal_path: "state/trades.jsonl"
+  heartbeat_s: 30

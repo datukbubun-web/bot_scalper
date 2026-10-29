@@ -147,3 +147,44 @@ Rilis pertama: kerangka lengkap, diuji end-to-end.
   a coin at n=18.
 - Four directional variants, none significant, none distinguishable from the
   placebo arm. The best needs ≈876 events (~2,190 months of data); 18 exist.
+
+### Added — macro blackout gate
+- `RiskConfig.blackout_enabled / blackout_pre_min / blackout_post_min /
+  blackout_kinds / blackout_windows` and `RiskEngine.blackout_status(now_ms)`.
+  Entry is paused from 15 min before an NFP/CPI/FOMC release to 15 min after,
+  and resumes **on its own** — nothing to clear, no operator action. Open
+  positions are *not* touched: this is an entry gate, not a flat-everything
+  switch, because force-closing into a 22×-range bar is the worst trade of the
+  day. The calendar is wrapped in a try/except so a calendar failure can never
+  take down the trading loop; explicit `blackout_windows` cover surprise events
+  and maintenance.
+- `RiskDecision.details["blackout_seconds_left"]`, and a human-readable message
+  (`macro blackout until 2026-10-02T12:45:00Z (20 min left)`).
+
+### Added — capital guards for a small account
+- `max_total_loss_pct`: measured from `initial_equity` and it **latches the kill
+  switch**. A daily brake resets every 24 h; the deposit does not, and a $100
+  account can lose 10% in a single day.
+- `min_equity`: absolute floor, below which trading stops because the position
+  granularity itself becomes unworkable.
+- `RiskState.initial_equity`, recorded once and only once in `on_account()`
+  (previously three scattered assignments, which is how a limit silently drifts).
+
+### Added — `configs/live.mini100.yaml`
+A $100 preset sized to what the venue can actually fill: 1 qtyStep = 0.01 oz ≈
+$40.67 notional, spread 0.49 bps, `max_leverage 10` → a $1,000 position ceiling
+and 0.24 oz ≈ $976 notional per trade. `max_daily_trades 8`, `max_positions 1`,
+`dry_run: true`. Slippage on a 100 oz ($407k) order measures **0**, so size is
+not the constraint — the absence of edge is.
+
+### Fixed
+- `live/engine.py` passed `now_ms=None` into `risk.evaluate()`, so every
+  time-based guard silently fell back to the engine's own clock. Blackout and
+  cooldown now receive the same clock the loop uses.
+
+### Tests
+- `tests/test_blackout_and_mini_account.py` — 17 tests: pause before/at/after a
+  release, automatic resume, half-open window boundaries, per-kind filtering,
+  disabled flag, hand-declared windows, kill-switch latching, `initial_equity`
+  write-once, `min_equity`, and the shipped preset's sizing under the leverage
+  cap. Suite: **144 passed**.

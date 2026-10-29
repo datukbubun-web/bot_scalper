@@ -284,6 +284,10 @@ class LiveEngine:
                 {"symbol": p.symbol, "side": p.side, "qty": p.qty} for p in positions
             ],
             gross_exposure=sum((p.exposure or 0.0) for p in positions),
+            # Pass the clock explicitly: the macro blackout and the cooldown
+            # compare against wall time, and defaulting to None silently used a
+            # different time source than the rest of the loop.
+            now_ms=int(self._clock() * 1000),
         )
 
         record = {
