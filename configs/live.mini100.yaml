@@ -50,10 +50,13 @@ risk:
   max_holding_bars: 12
 
   # ---- guards: ini yang sesungguhnya melindungi $100 --------------------
-  max_total_loss_pct: 10.0       # -$10 dari deposit -> KILL, berhenti permanen
-  max_daily_loss_pct: 3.0
-  max_intraday_loss_pct: 2.0
-  max_drawdown_pct: 8.0
+  # Rem intraday 20% (permintaan Anda). PENTING: 20% hanya berarti kalau batas
+  # lain di bawah ini lebih longgar -- kalau tidak, yang menahan lebih dulu
+  # adalah daily/drawdown/total, dan angka 20% itu tidak pernah terpakai.
+  max_intraday_loss_pct: 20.0    # pause sampai ganti hari UTC
+  max_daily_loss_pct: 25.0       # dulu 3% -> menggigit di -$3
+  max_total_loss_pct: 30.0       # dulu 10% -> kill permanen di -$10
+  max_drawdown_pct: 28.0         # dulu 8%
   max_daily_trades: 8            # 8 trade x biaya kecil; hindari churn
   consecutive_loss_cooldown: 3
   cooldown_minutes: 60

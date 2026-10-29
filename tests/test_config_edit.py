@@ -28,10 +28,11 @@ def cfg(tmp_path):
 
 def test_edit_changes_only_the_named_key(cfg):
     before = cfg.read_text()
+    old_line = [l for l in before.splitlines() if l.strip().startswith("max_intraday_loss_pct")][0]
     set_values(cfg, {"max_intraday_loss_pct": 2.5})
     after = cfg.read_text()
     changed = [a for a, b in zip(before.splitlines(), after.splitlines()) if a != b]
-    assert changed == ["  max_intraday_loss_pct: 2.0"]
+    assert changed == [old_line], f"more than the target line changed: {changed}"
     assert len(before.splitlines()) == len(after.splitlines())
 
 
@@ -96,13 +97,15 @@ def test_integer_settings_stay_integers(cfg):
 
 
 def test_brake_is_described_in_stops():
-    """The user asked for 2%; what matters is that 2% is four stops, not two."""
+    """Whatever the brake is set to, it must be expressed in stops -- that is the
+    number the operator can actually reason about."""
     from pxscalper.ops.config_edit import read_effective
 
     cfg = read_effective(PRESET, allow_env=False)
     rows = dict((name, (value, meaning)) for name, value, meaning in describe(cfg))
     assert rows["max_intraday_loss_pct"][1].startswith("pause")
-    assert "4.0 stops" in rows["max_intraday_loss_pct"][1]
+    expected = cfg.max_intraday_loss_pct / cfg.risk_per_trade_pct
+    assert f"{expected:.1f} stops" in rows["max_intraday_loss_pct"][1]
     assert "PERMANENT" in rows["max_total_loss_pct"][1]
 
 

@@ -308,3 +308,62 @@ sampai 10x satu stop. Dalam preset ini: satu stop ≈ $0.50, jadi 10 stop ≈ $5
 separuh dari batas harian 3% ($3), dan masih jauh dari `max_total_loss_pct` 10%
 ($10). Yang menahan bukan target profitnya, tapi rem intraday 2% dan batas total
 10% itu.
+
+
+## 11. Rem intraday 20% — dan kenapa batas lain harus ikut naik
+
+Permintaan: rem intraday 20%. Sudah dipasang, **tapi angka itu tidak akan
+berfungsi** kalau batas lain dibiarkan. Bukti dari engine:
+
+**Sebelum (rem 2%, batas total 10%):**
+```
+equity $ 95.00  FLAT   intraday drawdown 5.00% >= 2.0%
+equity $ 89.00  BLOCK  TOTAL LOSS LIMIT: down 11.00%
+```
+
+**Rem 20% tapi batas lain TIDAK diubah:**
+```
+equity $ 97.00  BLOCK  daily loss -3.00% breached   <-- berhenti di -3%!
+```
+
+Jadi menaikkan rem ke 20% saja tidak mengubah apa pun — yang menahan lebih dulu
+adalah `max_daily_loss_pct: 3%`. Setelan itu akan terlihat "sudah dipasang" tapi
+tidak pernah terpakai. Itu lebih buruk daripada menolak permintaannya.
+
+**Sesudah diselaraskan:**
+
+| Guard | Lama | Sekarang | Artinya |
+|---|---|---|---|
+| `max_intraday_loss_pct` | 2% | **20%** | jeda sampai ganti hari UTC |
+| `max_daily_loss_pct` | 3% | **25%** | kill switch harian |
+| `max_drawdown_pct` | 8% | **28%** | dari puncak ekuitas |
+| `max_total_loss_pct` | 10% | **30%** | **permanen**, dari deposit |
+
+Perilaku terukur:
+```
+equity $ 85.00 (-15.0%)  ALLOW_REDUCED  masih trading
+equity $ 81.00 (-19.0%)  ALLOW_REDUCED  masih trading
+equity $ 80.00 (-20.0%)  FLAT           rem intraday aktif
+equity $ 70.00 (-30.0%)  BLOCK          TOTAL LOSS LIMIT -> kill permanen
+```
+
+### Yang perlu Anda sadari
+
+Dengan setelan ini, **bot bisa kehilangan $20 dalam satu hari sebelum berhenti**,
+dan $30 sebelum kill permanen. Pada akun $100 itu berarti:
+
+- 20% = 40 stop berturut-turut (satu stop ≈ 0.5%)
+- Batas harian kini 25%, bukan 3% — jadi tidak ada lagi pengaman harian yang
+  ketat; yang bekerja adalah rem intraday 20% itu sendiri
+- Angka-angka ini konsisten satu sama lain (intraday < daily < total), dan ada
+  tes yang menjaganya supaya tidak ada yang "terpasang tapi mati"
+
+Kalau nanti Anda ingin mengubahnya lagi, aturan yang harus dijaga:
+`max_intraday_loss_pct < max_daily_loss_pct < max_total_loss_pct`.
+Kalau tidak, guard yang lebih ketat akan selalu menang dan setelan Anda tidak
+akan pernah aktif.
+
+```bash
+pxs risk set max_intraday_loss_pct=20
+pxs risk show          # lihat urutannya
+```

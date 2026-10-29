@@ -202,3 +202,43 @@ def test_slot_split_can_be_turned_off():
         now_ms=_et(2026, 10, 2) + 3 * 3_600_000,
     )
     assert verdict.qty * 4067.18 > 400.0, "full ceiling should be usable when splitting is off"
+
+
+# ── guard ordering: a loose brake must actually be the one that grips ───────
+def test_intraday_brake_grips_when_it_is_the_loosest_relevant_limit():
+    """If the operator sets the brake to 20%, it must fire at 20% -- not be
+    silently pre-empted by a 3% daily limit. That failure mode makes the setting
+    look applied while doing nothing, which is worse than refusing it."""
+    import tempfile
+
+    from pxscalper.features.calendar import _et
+    from pxscalper.risk.engine import RiskConfig, RiskEngine, RiskState
+
+    d = tempfile.mkdtemp()
+    engine = RiskEngine(
+        RiskConfig.from_dict({
+            "risk_per_trade_pct": 0.5, "max_leverage": 10.0,
+            "max_gross_exposure_pct": 1000.0, "max_positions": 10,
+            "max_positions_per_symbol": 10, "blackout_enabled": False,
+            "max_intraday_loss_pct": 20.0, "max_daily_loss_pct": 25.0,
+            "max_drawdown_pct": 28.0, "max_total_loss_pct": 30.0,
+            "state_path": f"{d}/r", "kill_switch_path": f"{d}/K",
+        }),
+        RiskState(),
+    )
+    engine.on_account(100.0)
+    now = _et(2026, 10, 2) + 3 * 3_600_000
+
+    def at(equity: float):
+        return engine.evaluate(
+            symbol="XAU/USD", direction=1, confidence=0.6, edge=0.1, price=4067.18,
+            equity=equity, atr=1.5, spread_bps=0.49, market_open=True,
+            min_qty=0.01, qty_step=0.01, price_step=0.01, now_ms=now,
+        )
+
+    assert at(85.0).decision.is_tradeable, "should still trade at -15%"
+    brake = at(80.0)
+    assert not brake.decision.is_tradeable
+    assert "intraday" in brake.reason, brake.reason
+    assert at(70.0).decision.name == "BLOCK"  # permanent total-loss limit
+    assert engine.kill.engaged()

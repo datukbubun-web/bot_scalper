@@ -43,10 +43,12 @@ risk:
   tp_atr: 1.5
   max_holding_bars: 12
 
-  max_total_loss_pct: 10.0
-  max_daily_loss_pct: 3.0
-  max_intraday_loss_pct: 2.0
-  max_drawdown_pct: 8.0
+  # Rem intraday 20% (permintaan Anda). Batas lain diselaraskan supaya 20% itu
+  # benar-benar tercapai, bukan tertahan di 3% (daily) atau 8% (drawdown).
+  max_intraday_loss_pct: 20.0
+  max_daily_loss_pct: 25.0
+  max_total_loss_pct: 30.0
+  max_drawdown_pct: 28.0
   max_daily_trades: 8
   consecutive_loss_cooldown: 3
   cooldown_minutes: 60

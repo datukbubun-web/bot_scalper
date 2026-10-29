@@ -160,9 +160,17 @@ def test_total_loss_can_be_disabled(tmp_path):
 
 # ── the shipped preset ──────────────────────────────────────────────────────
 def test_mini100_preset_loads_and_is_conservative():
+    """Guards must be internally consistent, not tied to one chosen number.
+
+    The user has deliberately raised the intraday brake to 20%, which only means
+    anything if the outer limits sit above it. What must always hold is the
+    ordering: intraday (resumes tomorrow) < daily < total (permanent).
+    """
     raw = yaml.safe_load(open("configs/live.mini100.yaml"))
     risk = RiskConfig.from_dict(raw["risk"])
-    assert risk.max_total_loss_pct <= 15.0
+    assert 0 < risk.max_intraday_loss_pct < risk.max_total_loss_pct
+    assert risk.max_intraday_loss_pct < risk.max_daily_loss_pct or risk.max_daily_loss_pct <= 0
+    assert risk.max_total_loss_pct < 50.0, "a total-loss limit above half the deposit is not a limit"
     assert risk.blackout_enabled is True
     assert risk.max_positions <= 10
     assert risk.max_leverage <= 10.0

@@ -319,3 +319,17 @@ staged entries open to $976 total, and an 11th is refused.
 `pxs risk set close_all_on_profit=5` and `pxs risk show` now include the target.
 
 Tests: 15 in `tests/test_basket_target.py` (215 total).
+
+### Changed — intraday brake 2% -> 20% (and the outer limits raised with it)
+Setting the brake to 20% while `max_daily_loss_pct` stayed at 3% would have done
+nothing: the daily limit grips at −3% and the brake would never be reached —
+applied on paper, dead in practice. The limits are now ordered so the brake
+actually grips: intraday 20% < daily 25% < total 30% (permanent), drawdown 28%.
+
+Verified: still trading at −19%, braked at −20%, permanent kill at −30%. A test
+now enforces `intraday < daily < total` so no future edit can leave a guard
+installed but unreachable, plus one that drives equity down and asserts the
+brake is the guard that fires at 20%.
+
+Consequence stated plainly in the docs: on a $100 account this permits losing
+$20 in a day and $30 in total before stopping.
