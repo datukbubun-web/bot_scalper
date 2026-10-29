@@ -1,5 +1,26 @@
 # pxscalper — FX Scalping Stack for PrimeXBT
 
+## Artefak model & cache data yang ikut di repo
+
+Beberapa file biner **sengaja** ada di commit (di-*force add*, karena
+`.gitignore` mengabaikannya secara default). Ambil hanya yang Anda butuhkan.
+
+| Path | Isi | Peringatan |
+|---|---|---|
+| `artifacts/models/latest/` | TCN terakhir (`.pt`, `.ts`, `.onnx`), manifest, kalibrasi | Dilatih pada 45.000 bar saja. `val_loss` **kalah** dari baseline kelas-frekuensi: **tidak punya edge**. Jangan dipakai live. Lihat `docs/DIRECTION_MODEL_REPORT.md`. |
+| `artifacts/models/smoke/` | Model hasil uji smoke (sintetis) | Bukan model sungguhan. |
+| `artifacts/xau_5M/`, `artifacts/xau_15M/` | Model percobaan per bar-size | Sama: tanpa edge terukur. |
+| `data/*.parquet`, `data/*.csv.gz` | Cache bar (XAU/USD 200k bar 1M, EUR/GBP/USD, XAG, USD/CAD, USD/CHF) | Data harga publik. ~14 MB. Bisa diunduh ulang dengan `pxs data`. |
+
+Reproduksi hasil training: `python3 scripts/training/train_sl.py --arch tcn
+--symbol XAU/USD --bars 1M --n-bars 45000 --no-download --fail-if-no-edge`
+(akan keluar dengan status **gagal**, dan itu memang tujuannya).
+
+`logs/` dan `state/` **kosong** saat commit ini dibuat, jadi tidak ada yang
+dipindahkan. Keduanya tetap di-`.gitignore` ke depan karena dapat berisi
+riwayat posisi dan kredensial.
+
+
 Bot scalping forex (dan CFD kripto) untuk PrimeXBT: **TCN / LSTM-GRU / PatchTST-style Transformer + PPO/SAC**, dengan inferensi **TorchScript / ONNX Runtime** di jalur panas, risk engine yang tidak bisa ditawar model, dan eksekusi yang memeriksa biaya sebelum mengirim order.
 
 > ⚠️ **Baca ini dulu.** Trading dengan leverage bisa menghabiskan seluruh modal Anda. Repo ini adalah *engine* — bukan jaminan profit, bukan nasihat keuangan. Tidak ada model deep learning yang bisa memprediksi FX dengan akurasi tinggi secara konsisten; edge yang realistis di scalping berasal dari **eksekusi, biaya, dan disiplin risiko**, bukan dari keajaiban arsitektur. Jalankan `paper` minimal beberapa minggu dan uji di **demo account** PrimeXBT sebelum uang sungguhan.

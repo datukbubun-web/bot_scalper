@@ -1,0 +1,58 @@
+{
+  "arch": "tcn",
+  "torchscript_path": "/home/user/pxscalper/artifacts/models/latest/tcn.ts",
+  "onnx_path": "/home/user/pxscalper/artifacts/models/latest/tcn.onnx",
+  "model_config": {
+    "n_features": 38,
+    "lookback": 64,
+    "n_outputs": 3,
+    "task": "classification",
+    "channels": [
+      64,
+      64,
+      64,
+      64
+    ],
+    "kernel_size": 3,
+    "dropout": 0.1,
+    "rnn_type": "lstm",
+    "hidden_size": 64,
+    "num_layers": 1,
+    "patch_len": 8,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "ff_mult": 2,
+    "head_hidden": 64,
+    "use_layer_norm": true
+  },
+  "latency_us": {
+    "pytorch_eager": {
+      "mean_us": 1109.254159,
+      "p50_us": 1076.495,
+      "p90_us": 1249.3576000000003,
+      "p99_us": 1858.6272699999997,
+      "max_us": 2916.137
+    },
+    "torchscript": {
+      "mean_us": 946.9742285,
+      "p50_us": 901.335,
+      "p90_us": 1087.8366000000003,
+      "p99_us": 1810.8292199999999,
+      "max_us": 5787.911
+    },
+    "onnxruntime": {
+      "mean_us": 249.7009115,
+      "p50_us": 238.3655,
+      "p90_us": 297.41020000000003,
+      "p99_us": 427.09876999999994,
+      "max_us": 599.624
+    },
+    "_summary": {
+      "p99_speedup_onnx_vs_eager": 4.35,
+      "iterations": 2000,
+      "on_cpu_threads": 2
+    }
+  },
+  "onnx_opsets": null
+}

@@ -1,0 +1,8 @@
+{
+  "temperature": 1.8886086916053075,
+  "nll_before": 1.0977452993392944,
+  "nll_after": 1.0947506773869689,
+  "n_samples": 2976,
+  "arch": "tcn",
+  "symbol": "EUR/USD"
+}
