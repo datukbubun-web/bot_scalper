@@ -119,3 +119,31 @@ Rilis pertama: kerangka lengkap, diuji end-to-end.
   not *which way*.
 - Publishing that honestly needs power analysis, not intuition: the attractive
   cells need 112–5,279 days of data and we have 101.
+
+## [Unreleased] — 2026-10-29 (event breakout study)
+
+### Added
+- `backtest/event_study.py` — `simulate_barrier_trade`, a barrier simulator that
+  is correct per side, resolves both-barrier bars pessimistically, and returns
+  what the *chosen* side earned.
+- `scripts/training/eval_event_breakout.py` — event study with four
+  pre-registered variants (momentum, reversal, breakout 5m, breakout 15m), a
+  matched placebo arm, per-event aggregation and a power check.
+- `tests/test_event_study.py` — 10 tests.
+
+### Fixed
+- **Shorts were evaluated with their target and stop swapped**, which produced a
+  +73.42 bps per event "edge" with p=0.013 that beat the placebo arm and
+  survived 5 bps of costs. The barriers were computed once from the long side
+  and reused for both. Corrected, the same variants are +2.9 / +2.8 / +7.3 /
+  −1.1 bps with p ≥ 0.59: nothing. The simulator now lives in the package with
+  tests instead of a one-shot script, because a script that produced a
+  plausible-looking 73 bps would have been believed.
+
+### Findings (docs/EVENT_BREAKOUT_REPORT.md)
+- The mechanism is real: the median release-bar range is **87.2 bps vs 3.96 bps**
+  normally (22×), matching the calendar's volatility signal.
+- The direction is not: 56% of post-release bars move up, indistinguishable from
+  a coin at n=18.
+- Four directional variants, none significant, none distinguishable from the
+  placebo arm. The best needs ≈876 events (~2,190 months of data); 18 exist.
