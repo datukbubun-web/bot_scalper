@@ -196,3 +196,46 @@ max_intraday_loss_pct ÷ risk_per_trade_pct = jumlah stop yang muat
 2.0% ÷ 0.5% = 4 stop     <- preset sekarang
 0.75% ÷ 0.5% = 1.5 stop  <- preset lama: satu kerugian normal + slippage = berhenti
 ```
+
+
+## 9. Satu instrumen saja — sekarang ditegakkan, bukan cuma default
+
+`symbols: ["XAU/USD"]` di YAML adalah **nilai default**, bukan aturan. Siapa pun
+bisa menambah simbol kedua dalam sepuluh detik dan bot langsung trading dua
+instrumen. Sekarang ada aturannya:
+
+```yaml
+symbols: ["XAU/USD"]          # top level
+
+risk:
+  single_symbol: true          # tegakkan hanya satu instrumen
+  allowed_symbols: ["XAU/USD"] # allow-list; order di luar ini ditolak
+```
+
+Ditegakkan di **dua lapis**:
+
+| Lapis | Perilaku |
+|---|---|
+| `build_engine()` saat start | menolak start kalau `symbols` > 1 sementara `single_symbol: true` |
+| `RiskEngine.evaluate()` per order | menolak order untuk simbol di luar `allowed_symbols`, **sebelum** guard lain dicek |
+
+`pxs risk show` sekarang menampilkan scope-nya:
+
+```
+│ symbols                │   XAU/USD │ single instrument only                  │
+```
+
+### Bug yang ditemukan saat mengerjakan ini
+
+Waktu menguji aturan di atas, ternyata ada masalah yang lebih besar:
+`build_engine()` membaca `raw["live"]["symbols"]`, padahal **semua** contoh dan
+preset menaruh `symbols` di **level teratas**. Pembacaan itu selalu gagal dan
+jatuh ke default `LiveConfig` = **`EUR/USD`**.
+
+Artinya: `pxs trade --config configs/live.mini100.yaml` akan menjalankan
+**EUR/USD**, sementara file, dokumentasi, dan blok risiko semuanya bilang
+XAU/USD. Konfigurasi yang menyebut satu instrumen menjalankan instrumen lain.
+
+Sudah diperbaiki: kedua tata letak dibaca (level teratas diutamakan), dan config
+tanpa `symbols` sekarang **gagal keras** alih-alih diam-diam memakai EUR/USD.
+Ada tes regresi khusus untuk ini.
