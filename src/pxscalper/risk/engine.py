@@ -119,6 +119,10 @@ class RiskConfig:
     # bet at 10x the size. Cap per symbol as well as in total.
     max_positions_per_symbol: int = 1
     max_gross_exposure_pct: float = 300.0  # notional / equity
+    # Share the exposure ceiling across the remaining position slots, so a
+    # 10-position configuration can actually open 10 positions instead of the
+    # first order consuming the whole ceiling.
+    split_exposure_across_slots: bool = True
     max_leverage: float = 5.0
     min_qty_fraction: float = 1.0          # 1.0 = never round up above risk budget
     # stops / targets
@@ -701,12 +705,17 @@ class RiskEngine:
             return verdict(RiskDecision.BLOCK, str(exc))
         raw_qty = risk_amount / max(stop_distance * coeff, 1e-12)
 
-        # cap by leverage / gross exposure, minus whatever is already open:
-        # ten positions each sized against the full ceiling is not a limit.
-        max_notional = min(
-            equity * cfg.max_leverage,
-            max(ceiling_notional - open_notional, 0.0),
-        )
+        # cap by leverage / gross exposure, minus whatever is already open.
+        room = max(ceiling_notional - open_notional, 0.0)
+        # ... and share that room across the slots still available. Without this
+        # the first order takes the entire ceiling and the second is refused:
+        # "up to 10 positions" would be unreachable in practice even though
+        # every guard says it is allowed.
+        slots_left = max(cfg.max_positions - len(positions), 1)
+        per_slot = room / slots_left if cfg.split_exposure_across_slots else room
+        max_notional = min(equity * cfg.max_leverage, per_slot)
+        details["budget_per_slot"] = per_slot
+        details["slots_left"] = slots_left
         max_qty_by_leverage = max_notional / max(price * coeff, 1e-12)
         reduced = False
         if raw_qty > max_qty_by_leverage:

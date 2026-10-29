@@ -145,6 +145,8 @@ def test_multi_position_preset_loads_and_keeps_the_total_capped():
     raw = yaml.safe_load(open("configs/live.mini100.multi.yaml"))
     cfg = RiskConfig.from_dict(raw["risk"], allow_env=False)
     assert cfg.max_positions == 10
-    assert cfg.max_positions_per_symbol == 1, "10 bets on one symbol is not diversification"
+    # The user explicitly asked for up to 10 staged entries in one instrument,
+    # with a basket target that closes them all together.
+    assert cfg.max_positions_per_symbol == 10
     assert cfg.max_gross_exposure_pct <= 1000.0
     assert raw["execution"]["dry_run"] is True

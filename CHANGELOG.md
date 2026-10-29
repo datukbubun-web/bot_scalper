@@ -287,3 +287,35 @@ instead of quietly defaulting.
 Tests: 14 in `tests/test_single_symbol.py` (200 total), including the regression
 for the top-level `symbols` bug and a check that the scope guard is evaluated
 before the other guards.
+
+### Added — basket profit target: close ALL positions at a dollar amount
+`risk/basket.py` + `LiveEngine._check_basket_target()`. Set
+`close_all_on_profit: 3.0` and the bot closes **every** open position once the
+combined unrealised PnL reaches $3 — including legs that are still losing, which
+is what was asked for and what the counter-intuitive part hinges on.
+
+Deliberate details:
+- Checked **every loop cycle**, not per bar: profit peaks between bars, and
+  waiting for a close is exactly how the target is given back.
+- `close_all_enforce: false` reports the trigger without acting, so a paper run
+  can observe the rule before trusting it.
+- Positions are closed one by one (not the venue's `close/all`), so every close
+  has its own audit record — including the losing leg, which will need
+  explaining later.
+- A **failed** close does not mark the target as fired, so a single API error
+  cannot silently disarm the rule.
+- `close_all_cooldown_s` stops immediate re-firing on the next cycle's first
+  position.
+- An unknown position shape raises instead of counting as $0.00; a basket total
+  that quietly ignores a position is worse than no basket rule.
+
+### Changed — up to 10 staged entries in one symbol, and the ceiling is now split
+`max_positions_per_symbol: 10` in both presets, with the exposure ceiling shared
+across the remaining slots (`split_exposure_across_slots`). Without that split
+the first order consumed the entire $1,000 ceiling and the second was refused:
+"10 positions" was allowed on paper and unreachable in practice. Verified: ten
+staged entries open to $976 total, and an 11th is refused.
+
+`pxs risk set close_all_on_profit=5` and `pxs risk show` now include the target.
+
+Tests: 15 in `tests/test_basket_target.py` (215 total).

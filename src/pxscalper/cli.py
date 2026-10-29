@@ -372,7 +372,7 @@ def risk_show(
     things, and confusing them is how a small account dies.
     """
     _bootstrap()
-    from .ops.config_edit import describe, read_effective
+    from .ops.config_edit import TOP_LEVEL_DEFAULTS, describe, read_effective, read_top_level
 
     if not Path(config).exists():
         console.print(f"[red]{config} not found[/red]")
@@ -384,6 +384,13 @@ def risk_show(
     table.add_column("what it does")
     for name, value, meaning in describe(cfg):
         table.add_row(name, value, meaning)
+    top = read_top_level(config)
+    table.add_row(
+        "close_all_on_profit",
+        f"${top['close_all_on_profit']:g}",
+        "close ALL when basket profit hits this"
+        + ("" if top["close_all_enforce"] else " (report only!)"),
+    )
     console.print(table)
     if cfg.max_intraday_loss_pct and cfg.risk_per_trade_pct:
         stops = cfg.max_intraday_loss_pct / cfg.risk_per_trade_pct
@@ -408,30 +415,44 @@ def risk_set(
         pxs risk set max_total_loss_pct=10 max_daily_trades=6
     """
     _bootstrap()
-    from .ops.config_edit import ConfigEditError, read_risk, set_values, summarise
+    from .ops.config_edit import (
+        TOP_LEVEL_DEFAULTS,
+        ConfigEditError,
+        read_risk,
+        set_top_level,
+        set_values,
+        summarise,
+    )
 
     if not Path(config).exists():
         console.print(f"[red]{config} not found[/red]")
         raise typer.Exit(2)
 
     updates: dict[str, str] = {}
+    top_updates: dict[str, str] = {}
     for item in assignments:
         field, sep, value = item.partition("=")
         if not sep:
             console.print(f"[red]'{item}' is not FIELD=VALUE[/red]")
             raise typer.Exit(2)
-        updates[field.strip()] = value.strip()
+        name = field.strip()
+        if name in TOP_LEVEL_DEFAULTS:
+            top_updates[name] = value.strip()
+        else:
+            updates[name] = value.strip()
 
     try:
         if dry_run:
             from .ops.config_edit import coerce, format_value
 
-            current = read_risk(config)
+            current = {**read_risk(config), **read_top_level(config)}
             console.print("[yellow]dry run — nothing written[/yellow]")
             for k, v in updates.items():
                 console.print(f"  {k}: {current.get(k)!r} -> {format_value(coerce(k, v))}")
             raise typer.Exit(0)
-        changes = set_values(config, updates)
+        changes = set_values(config, updates) if updates else []
+        if top_updates:
+            changes += set_top_level(config, top_updates)
     except ConfigEditError as exc:
         console.print(f"[red]refused:[/red] {exc}")
         raise typer.Exit(2) from exc

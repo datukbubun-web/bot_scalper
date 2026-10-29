@@ -2,9 +2,11 @@
 #
 # PERINGATAN — baca ini dulu:
 # 10 posisi di akun $100 bukan diversifikasi. Kalau semuanya di XAU/USD, itu
-# SATU taruhan dengan ukuran 10x. Karena itu `max_positions_per_symbol: 1`:
-# 10 posisi berarti 10 instrumen BERBEDA, dan Anda butuh minimal 10 simbol
-# yang layak (dan biayanya sudah lolos gerbang `pxs edge`) untuk mengisinya.
+# SATU taruhan dengan ukuran 10x. Itu disengaja di sini: masuk bertahap
+# (scaling in) pada XAU/USD, dengan target profit gabungan $3 yang menutup
+# semuanya sekaligus. Risikonya: 10 entry searah bisa kena stop bersamaan,
+# jadi kerugian totalnya sampai 10x satu stop. Karena itu max_total_loss_pct
+# 10% tetap menjadi batas keras.
 #
 # Plafon eksposur total tetap mengikat: $100 x 1000% = $1.000 notional
 # untuk SELURUH posisi, bukan per posisi. Sepuluh posisi @ $100 = $1.000.
@@ -32,8 +34,10 @@ risk:
 
   risk_per_trade_pct: 0.5
   max_positions: 10              # <-- ubah angka ini sesuai keinginan (1..10)
-  max_positions_per_symbol: 1     # <-- 1 = satu taruhan per simbol
+  max_positions_per_symbol: 10    # <-- semuanya boleh di XAU/USD (bertahap)
   max_gross_exposure_pct: 1000.0   # plafon TOTAL semua posisi
+  split_exposure_across_slots: true  # $1.000 dibagi ke slot yang tersisa,
+                                     # supaya 10 posisi benar-benar bisa dibuka
   max_leverage: 10.0
   sl_atr: 1.0
   tp_atr: 1.5
@@ -60,6 +64,20 @@ risk:
   min_edge: 0.03
   max_daily_loss_stop: true
   allow_hedging: false
+
+# ---- target profit gabungan: tutup SEMUA posisi ----------------------
+# Kalau total profit semua posisi (termasuk yang masih rugi) mencapai angka ini,
+# bot menutup semuanya. Ini yang Anda minta: $3 tercapai = selesai, walau ada
+# posisi yang masih lose.
+close_all_on_profit: 3.0      # dalam mata uang akun (USD). 0 = mati
+close_all_enforce: true       # true = benar-benar menutup; false = hanya lapor
+close_all_cooldown_s: 300     # jeda sebelum bisa memicu lagi setelah flat
+
+# ---- masuk bertahap (scaling in) di satu simbol -----------------------
+# Tidak ada saklar khusus: `max_positions_per_symbol` sudah mengizinkan sampai
+# 10 entry searah di XAU/USD. PERINGATAN: 10 entry searah bisa kena stop
+# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 2% dan
+# max_total_loss_pct 10% yang menahannya.
 
 execution:
   order_type: "market"

@@ -82,6 +82,15 @@ def build_engine(
         loop_sleep_s=float(live_raw.get("loop_sleep_s", 2.5)),
         max_hold_bars=int(live_raw.get("max_hold_bars", 45)),
         trailing_stop_atr=float(live_raw.get("trailing_stop_atr", 0.0)),
+        close_all_on_profit=float(
+            live_raw.get("close_all_on_profit", raw.get("close_all_on_profit", 0.0))
+        ),
+        close_all_enforce=bool(
+            live_raw.get("close_all_enforce", raw.get("close_all_enforce", False))
+        ),
+        close_all_cooldown_s=float(
+            live_raw.get("close_all_cooldown_s", raw.get("close_all_cooldown_s", 300.0))
+        ),
         paper=not allow_live,
         log_path=str(paths.logs / "decisions.jsonl"),
     )

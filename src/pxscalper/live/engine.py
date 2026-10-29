@@ -34,6 +34,7 @@ from ..exchange.rest import ApiError, PrimeXBTClient
 from ..execution.router import ExecutionResult, OrderRouter
 from ..features.pipeline import FeatureEngineer, FeatureConfig
 from ..inference.predictor import Predictor
+from ..risk.basket import BasketTarget
 from ..risk.engine import RiskEngine, RiskVerdict
 from ..strategy.decision import Decision, Intent, ScalpingStrategy
 from ..utils import JsonlLogger, bar_ms, now_ms
@@ -60,6 +61,15 @@ class LiveConfig:
     state_path: str = "state/live.json"
     refresh_settings_s: float = 3600.0
     refresh_account_s: float = 5.0
+    # ---- basket profit target ------------------------------------------------
+    # Close ALL positions once the combined unrealised PnL reaches this amount,
+    # even if some legs are still losing. Intended for scaled entry (several
+    # positions in one symbol): the account target is what the operator asked
+    # for, and waiting for every leg's own take-profit means giving the profit
+    # back while the losers stay open.
+    close_all_on_profit: float = 0.0     # 0 disables
+    close_all_enforce: bool = False      # False = report only (paper observation)
+    close_all_cooldown_s: float = 300.0  # re-arm delay after firing
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -96,6 +106,11 @@ class LiveEngine:
         self._last_loss_s = 0.0
         self._last_settings_refresh = 0.0
         self._running = False
+        self._basket = BasketTarget(
+            config.close_all_on_profit,
+            cooldown_s=config.close_all_cooldown_s,
+            clock=self._clock,
+        )
         self._consecutive_errors = 0
 
     # ---------------------------------------------------------------- lifecycle
@@ -157,6 +172,12 @@ class LiveEngine:
 
                 if now - self._last_settings_refresh >= self.config.refresh_settings_s:
                     self._refresh_settings(force=True)
+
+                # Basket target is checked every cycle, not per bar: profit can
+                # peak between bars and giving it back while waiting for a bar
+                # close is exactly what this rule exists to prevent.
+                if self._check_basket_target(positions):
+                    positions = self.client.positions()
 
                 for symbol in self.config.symbols:
                     if last_bar_time.get(symbol) == current_bar:
@@ -402,6 +423,45 @@ class LiveEngine:
             side=pos.side, qty=pos.qty, open_price=pos.open_price,
             current_price=pos.current_price, result=result.to_dict(),
         )
+
+    # ------------------------------------------------------- basket target
+    def _check_basket_target(self, positions: list[Position]) -> bool:
+        """Close every position when the combined PnL reaches the target.
+
+        Returns True when a close-all was issued. Closing is done position by
+        position on purpose: the exchange's `close/all` endpoint leaves no
+        per-position audit trail, and an audit trail is the only way to explain
+        afterwards why a losing leg was closed.
+        """
+        if not positions or self.config.close_all_on_profit <= 0:
+            return False
+        verdict = self._basket.evaluate(
+            positions, enforce=self.config.close_all_enforce
+        )
+        if verdict.triggered and not self.config.close_all_enforce:
+            self.audit.write("basket_target_report_only", **verdict.to_dict())
+            return False
+        if not verdict.triggered:
+            return False
+
+        log.warning("%s", verdict.reason)
+        self.audit.write("basket_target_hit", **verdict.to_dict())
+        closed = 0
+        for pos in positions:
+            result = self.router.close_position(pos, reason="basket profit target")
+            self._after_close(pos, result)
+            if result.ok:
+                closed += 1
+            else:
+                # Do NOT mark the cycle as done if a close failed: the guard must
+                # keep trying, otherwise a failed close silently disarms it.
+                log.error("basket close failed for %s: %s", pos.id, result.error)
+                return False
+        self._basket.mark_fired()
+        self.audit.write(
+            "basket_target_closed_all", closed=closed, total_pnl=verdict.total_pnl
+        )
+        return closed > 0
 
     # ------------------------------------------------------------------ helpers
     def _atr(self, symbol: str) -> float:

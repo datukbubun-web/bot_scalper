@@ -164,7 +164,7 @@ def test_mini100_preset_loads_and_is_conservative():
     risk = RiskConfig.from_dict(raw["risk"])
     assert risk.max_total_loss_pct <= 15.0
     assert risk.blackout_enabled is True
-    assert risk.max_positions == 1
+    assert risk.max_positions <= 10
     assert risk.max_leverage <= 10.0
     assert raw["execution"]["dry_run"] is True, "a real-money preset must start in dry-run"
 

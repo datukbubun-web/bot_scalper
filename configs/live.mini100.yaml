@@ -40,8 +40,11 @@ risk:
   # ---- sizing: kecil, karena tujuan utamanya bukan profit ---------------
   risk_per_trade_pct: 0.5        # $0.50 per trade pada akun $100
   max_leverage: 10.0             # $100 -> posisi maksimum $1,000
-  max_positions: 1               # satu posisi; modal mini tidak boleh dibagi
+  max_positions: 10              # sampai 10 posisi (masuk bertahap)
+  max_positions_per_symbol: 10   # semuanya di XAU/USD, sesuai permintaan
   max_gross_exposure_pct: 1000.0 # konsisten dengan max_leverage
+  split_exposure_across_slots: true  # $1.000 dibagi ke slot tersisa,
+                                     # supaya 10 posisi benar-benar bisa dibuka
   sl_atr: 1.0
   tp_atr: 1.5
   max_holding_bars: 12
@@ -71,6 +74,20 @@ risk:
 
   max_daily_loss_stop: true
   allow_hedging: false
+
+# ---- target profit gabungan: tutup SEMUA posisi ----------------------
+# Kalau total profit semua posisi (termasuk yang masih rugi) mencapai angka ini,
+# bot menutup semuanya. Ini yang Anda minta: $3 tercapai = selesai, walau ada
+# posisi yang masih lose.
+close_all_on_profit: 3.0      # dalam mata uang akun (USD). 0 = mati
+close_all_enforce: true       # true = benar-benar menutup; false = hanya lapor
+close_all_cooldown_s: 300     # jeda sebelum bisa memicu lagi setelah flat
+
+# ---- masuk bertahap (scaling in) di satu simbol -----------------------
+# Tidak ada saklar khusus: `max_positions_per_symbol` sudah mengizinkan sampai
+# 10 entry searah di XAU/USD. PERINGATAN: 10 entry searah bisa kena stop
+# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 2% dan
+# max_total_loss_pct 10% yang menahannya.
 
 execution:
   order_type: "market"

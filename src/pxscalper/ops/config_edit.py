@@ -40,6 +40,65 @@ def read_effective(path: str | Path, *, allow_env: bool = True) -> RiskConfig:
     return RiskConfig.from_dict(read_risk(path), allow_env=allow_env)
 
 
+# Top-level knobs that are not part of RiskConfig but that an operator tunes just
+# as often. Kept separate so `pxs risk set` can reach them.
+TOP_LEVEL_DEFAULTS: dict[str, Any] = {
+    "close_all_on_profit": 0.0,
+    "close_all_enforce": False,
+    "close_all_cooldown_s": 300.0,
+}
+
+
+def read_top_level(path: str | Path) -> dict[str, Any]:
+    raw = yaml.safe_load(Path(path).read_text()) or {}
+    return {k: raw.get(k, default) for k, default in TOP_LEVEL_DEFAULTS.items()}
+
+
+def set_top_level(path: str | Path, updates: dict[str, Any], *, validate: bool = True) -> list:
+    """Set top-level keys (basket target, pyramiding) by editing text."""
+    p = Path(path)
+    lines = p.read_text().splitlines(keepends=True)
+    before = read_top_level(p)
+    changes = []
+    for key, new in updates.items():
+        if key not in TOP_LEVEL_DEFAULTS:
+            known = ", ".join(sorted(TOP_LEVEL_DEFAULTS))
+            raise ConfigEditError(f"unknown setting '{key}'.\nknown: {known}")
+        coerce_target = TOP_LEVEL_DEFAULTS[key]
+        if isinstance(coerce_target, bool):
+            value = str(new).strip().lower() in ("1", "true", "yes", "on")
+        elif isinstance(coerce_target, int):
+            value = int(float(new))
+        else:
+            value = float(new)
+        pattern = re.compile(rf"^{re.escape(key)}\s*:.*$", re.MULTILINE)
+        if pattern.search("".join(lines)):
+            out = []
+            for line in lines:
+                if pattern.match(line.rstrip("\n")):
+                    comment = ""
+                    if "#" in line:
+                        comment = "  #" + line.split("#", 1)[1].rstrip("\n")
+                    out.append(f"{key}: {format_value(value)}{comment}\n")
+                else:
+                    out.append(line)
+            lines = out
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"{key}: {format_value(value)}\n")
+        changes.append((key, before.get(key), value))
+    updated = "".join(lines)
+    if validate:
+        try:
+            parsed = yaml.safe_load(updated) or {}
+            RiskConfig.from_dict(parsed.get("risk") or {}, allow_env=False)
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigEditError(f"refusing to write, result would not parse: {exc}") from exc
+    p.write_text(updated)
+    return changes
+
+
 # -------------------------------------------------------------------- coercion
 def coerce(key: str, value: Any) -> Any:
     """Turn a CLI/YAML string into the type the dataclass declares."""
