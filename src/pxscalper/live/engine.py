@@ -280,8 +280,19 @@ class LiveEngine:
             min_qty=settings.min_qty,
             qty_step=settings.qty_step,
             price_step=settings.min_price_step,
+            # Pass the *notional* of every open position: the risk engine sums
+            # these against the exposure ceiling. Sending only symbol/side/qty
+            # made every position look free, so each new order could reuse the
+            # full ceiling -- harmless with one position, 10x leverage with ten.
             open_positions=[
-                {"symbol": p.symbol, "side": p.side, "qty": p.qty} for p in positions
+                {
+                    "symbol": p.symbol,
+                    "side": p.side,
+                    "qty": p.qty,
+                    "mark_price": p.mark_price or p.current_price or p.open_price,
+                    "exposure": p.exposure,
+                }
+                for p in positions
             ],
             gross_exposure=sum((p.exposure or 0.0) for p in positions),
             # Pass the clock explicitly: the macro blackout and the cooldown

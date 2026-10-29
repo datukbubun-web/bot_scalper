@@ -244,3 +244,25 @@ split). Findings, all reproducible:
 docs/DIRECTION_MODEL_REPORT.md records it, including what would have to change
 first: target (triple-barrier, not direction), a base signal that passes the
 cost gate, 6–12 months of data instead of 31 days, and a longer hold.
+
+### Added — configurable open-position count (1..10) with a total-exposure cap
+`max_positions` is now editable like every other guard (`pxs risk set
+max_positions=10`), and a new `max_positions_per_symbol` prevents "10 positions"
+from becoming one bet at 10x the size.
+
+### Fixed — `max_gross_exposure_pct` was measured per order, never summed
+The ceiling was compared against the *candidate order only*. With one open
+position that is invisible; with ten it means ten times the intended leverage,
+because every new order could reuse the full ceiling. Now the notionals of all
+open positions are summed first, the remaining room is
+`ceiling − open`, and a new order is capped by that remainder. The live loop also
+passes `mark_price`/`exposure` per position so an open position never looks free
+(it previously sent only symbol/side/qty).
+
+`configs/live.mini100.multi.yaml` ships a 10-position variant, with
+`max_positions_per_symbol: 1`: ten positions means ten *different* instruments,
+and the file says so.
+
+Tests: 13 in `tests/test_position_limits.py`, including the regression that fails
+on the old code (two $900 positions against a $1,000 ceiling must block) and a
+check that a free position slot never overrides a full exposure budget.

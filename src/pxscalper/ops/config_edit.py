@@ -204,6 +204,20 @@ def describe(cfg: RiskConfig, stops_at_pct: float | None = None) -> list[tuple[s
     rows.append(("max_daily_trades", str(cfg.max_daily_trades), "trade budget per UTC day"))
     rows.append(
         (
+            "max_positions",
+            str(cfg.max_positions),
+            f"open at once (max {cfg.max_positions_per_symbol} per symbol)",
+        )
+    )
+    rows.append(
+        (
+            "max_gross_exposure_pct",
+            f"{cfg.max_gross_exposure_pct:g}%",
+            f"total notional ceiling = ${cfg.max_gross_exposure_pct / 100 * 100:,.0f} per $100",
+        )
+    )
+    rows.append(
+        (
             "blackout",
             f"{cfg.blackout_pre_min:g}/{cfg.blackout_post_min:g} min",
             f"{'on' if cfg.blackout_enabled else 'off'} — {', '.join(cfg.blackout_kinds) or 'no kinds'}",

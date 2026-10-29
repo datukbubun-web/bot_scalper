@@ -1,0 +1,70 @@
+# Varian multi-posisi dari live.mini100.yaml: sampai 10 posisi terbuka.
+#
+# PERINGATAN — baca ini dulu:
+# 10 posisi di akun $100 bukan diversifikasi. Kalau semuanya di XAU/USD, itu
+# SATU taruhan dengan ukuran 10x. Karena itu `max_positions_per_symbol: 1`:
+# 10 posisi berarti 10 instrumen BERBEDA, dan Anda butuh minimal 10 simbol
+# yang layak (dan biayanya sudah lolos gerbang `pxs edge`) untuk mengisinya.
+#
+# Plafon eksposur total tetap mengikat: $100 x 1000% = $1.000 notional
+# untuk SELURUH posisi, bukan per posisi. Sepuluh posisi @ $100 = $1.000.
+
+symbols: ["XAU/USD"]           # TAMBAHKAN simbol lain, kalau tidak posisi 2-10 tak terpakai
+bar_size: "5M"
+lookback: 64
+horizon: 5
+
+inference:
+  backend: "onnx"
+  confidence_threshold: 0.45
+  edge_threshold: 0.03
+
+strategy:
+  kind: "probabilistic"
+  min_confidence: 0.45
+  min_edge: 0.03
+  allow_flat: true
+  size_by_edge: false
+
+risk:
+  risk_per_trade_pct: 0.5
+  max_positions: 10              # <-- ubah angka ini sesuai keinginan (1..10)
+  max_positions_per_symbol: 1     # <-- 1 = satu taruhan per simbol
+  max_gross_exposure_pct: 1000.0   # plafon TOTAL semua posisi
+  max_leverage: 10.0
+  sl_atr: 1.0
+  tp_atr: 1.5
+  max_holding_bars: 12
+
+  max_total_loss_pct: 10.0
+  max_daily_loss_pct: 3.0
+  max_intraday_loss_pct: 2.0
+  max_drawdown_pct: 8.0
+  max_daily_trades: 8
+  consecutive_loss_cooldown: 3
+  cooldown_minutes: 60
+  min_equity: 60.0
+
+  blackout_enabled: true
+  blackout_pre_min: 15
+  blackout_post_min: 15
+  blackout_kinds: ["nfp", "cpi", "fomc"]
+
+  max_spread_bps: 1.5
+  min_atr_bps: 1.5
+  max_atr_bps: 15.0
+  min_confidence: 0.45
+  min_edge: 0.03
+  max_daily_loss_stop: true
+  allow_hedging: false
+
+execution:
+  order_type: "market"
+  max_slippage_bps: 3.0
+  reconcile_interval_s: 30
+  dry_run: true
+
+monitoring:
+  log_dir: "logs"
+  journal_path: "state/trades.jsonl"
+  heartbeat_s: 30

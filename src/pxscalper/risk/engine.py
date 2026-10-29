@@ -57,6 +57,36 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 
+def _normalise_position(raw: Any) -> dict[str, Any]:
+    """Accept dicts from tests or exchange ``Position`` objects from the loop.
+
+    The notional of an open position is what the exposure ceiling must count.
+    Without it every position looks free and `max_gross_exposure_pct` is a
+    decoration -- which is exactly the bug that let N positions each fill to the
+    full ceiling.
+    """
+    if isinstance(raw, dict):
+        out = dict(raw)
+    else:
+        out = {
+            "symbol": getattr(raw, "symbol", ""),
+            "side": getattr(raw, "side", ""),
+            "qty": getattr(raw, "qty", 0.0),
+            "exposure": getattr(raw, "exposure", None),
+            "mark_price": getattr(raw, "mark_price", None)
+            or getattr(raw, "current_price", None)
+            or getattr(raw, "open_price", None),
+        }
+    if not out.get("notional"):
+        exposure = out.get("exposure")
+        if exposure:
+            out["notional"] = abs(float(exposure))
+        else:
+            price = out.get("mark_price") or out.get("open_price") or 0.0
+            out["notional"] = abs(float(out.get("qty") or 0.0) * float(price or 0.0))
+    return out
+
+
 def _iso(ms: float) -> str:
     """UTC timestamp for log/verdict messages (never used for logic)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000.0))
@@ -78,6 +108,9 @@ class RiskConfig:
     # sizing
     risk_per_trade_pct: float = 0.25      # of equity, to the stop distance
     max_positions: int = 2
+    # Ten open positions in ONE symbol is not diversification, it is the same
+    # bet at 10x the size. Cap per symbol as well as in total.
+    max_positions_per_symbol: int = 1
     max_gross_exposure_pct: float = 300.0  # notional / equity
     max_leverage: float = 5.0
     min_qty_fraction: float = 1.0          # 1.0 = never round up above risk budget
@@ -524,20 +557,35 @@ class RiskEngine:
             return verdict(RiskDecision.FLAT, f"edge {edge:.3f} < {cfg.min_edge}")
 
         # 7. exposure ----------------------------------------------------------
-        positions = open_positions or []
+        positions = [_normalise_position(p) for p in (open_positions or [])]
         same_symbol = [p for p in positions if p.get("symbol") == symbol]
         checks["max_positions"] = len(positions) < cfg.max_positions
         if not checks["max_positions"]:
             return verdict(RiskDecision.BLOCK, f"max positions ({cfg.max_positions}) reached")
-        if same_symbol and not cfg.allow_hedging:
-            existing = positions[0].get("side", "")
-            opposite = (existing.upper() == "BUY" and direction < 0) or (
-                existing.upper() == "SELL" and direction > 0
+        checks["max_positions_per_symbol"] = (
+            len(same_symbol) < cfg.max_positions_per_symbol
+        )
+        if not checks["max_positions_per_symbol"]:
+            return verdict(
+                RiskDecision.BLOCK,
+                f"already {len(same_symbol)} position(s) in {symbol}, "
+                f"limit is {cfg.max_positions_per_symbol}",
             )
-            if same_symbol and not opposite:
-                return verdict(RiskDecision.FLAT, "already positioned in this symbol")
-            if opposite and not cfg.allow_hedging:
+        # A *single* position per symbol is a "one bet only" rule, so it lives
+        # with the per-symbol cap above. Here we only forbid the genuinely
+        # dangerous combination: piling a same-side bet onto an existing one
+        # beyond the cap, or hedging when hedging is off.
+        if same_symbol and not cfg.allow_hedging:
+            sides = {str(p.get("side", "")).upper() for p in same_symbol}
+            opposite = ("BUY" in sides and direction < 0) or ("SELL" in sides and direction > 0)
+            if opposite:
                 details["note"] = "reverse handled by execution layer"
+            elif len(same_symbol) >= cfg.max_positions_per_symbol:
+                return verdict(
+                    RiskDecision.FLAT,
+                    f"already {len(same_symbol)} position(s) in this symbol "
+                    f"(cap {cfg.max_positions_per_symbol})",
+                )
 
         # 8. correlation -------------------------------------------------------
         checks["correlation_ok"] = True
@@ -549,6 +597,26 @@ class RiskEngine:
                     return verdict(
                         RiskDecision.BLOCK, f"correlated exposure already open ({others[0]})"
                     )
+
+        # 8b. TOTAL exposure across every open position -----------------------
+        # `max_gross_exposure_pct` used to cap a single order only: it was never
+        # compared against what was already open. With one position that is
+        # invisible; with ten it means 10x the intended leverage, and with a
+        # small account that is the difference between a bad day and a dead
+        # account. Sum first, then decide.
+        open_notional = sum(p.get("notional", 0.0) for p in positions)
+        ceiling_notional = equity * cfg.max_gross_exposure_pct / 100.0
+        details["open_notional"] = open_notional
+        details["gross_exposure_ceiling"] = ceiling_notional
+        checks["gross_exposure_ok"] = open_notional < ceiling_notional
+        if not checks["gross_exposure_ok"]:
+            return verdict(
+                RiskDecision.BLOCK,
+                f"gross exposure ${open_notional:,.0f} already at/above the "
+                f"${ceiling_notional:,.0f} ceiling "
+                f"({cfg.max_gross_exposure_pct:g}% of equity) across "
+                f"{len(positions)} position(s)",
+            )
 
         # 9. intraday brake ----------------------------------------------------
         if cfg.max_intraday_loss_pct > 0 and self.state.intraday_peak_equity > 0:
@@ -606,8 +674,12 @@ class RiskEngine:
             return verdict(RiskDecision.BLOCK, str(exc))
         raw_qty = risk_amount / max(stop_distance * coeff, 1e-12)
 
-        # cap by leverage / gross exposure
-        max_notional = min(equity * cfg.max_leverage, equity * cfg.max_gross_exposure_pct / 100.0)
+        # cap by leverage / gross exposure, minus whatever is already open:
+        # ten positions each sized against the full ceiling is not a limit.
+        max_notional = min(
+            equity * cfg.max_leverage,
+            max(ceiling_notional - open_notional, 0.0),
+        )
         max_qty_by_leverage = max_notional / max(price * coeff, 1e-12)
         reduced = False
         if raw_qty > max_qty_by_leverage:
@@ -632,9 +704,7 @@ class RiskEngine:
 
         # one step of the instrument must be affordable within the risk budget
         step_notional = qty_step * price * coeff
-        max_notional_room = min(
-            equity * cfg.max_leverage, equity * cfg.max_gross_exposure_pct / 100.0
-        )
+        max_notional_room = max_notional
         checks["step_feasible"] = step_notional <= max_notional_room if qty_step > 0 else True
         details["qty_step"] = qty_step
         details["notional_per_step"] = step_notional
