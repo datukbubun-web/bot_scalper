@@ -88,7 +88,7 @@ menambah kebocoran di atas biaya yang sudah dihitung.
 2. Baru setelah itu, mulai dengan **$100 penuh tapi risiko 0.5%** — bukan dinaikkan.
 3. Berhenti pada −10%. Titik. Jangan menambah deposit untuk "menyelamatkan" akun.
 
-## 7. Mengubah angka ini: YAML atau environment
+## 7. Mengubah angka ini: tiga cara
 
 Dua jalur resmi, keduanya diuji.
 
@@ -144,4 +144,55 @@ pxs trade --config configs/live.mini100.yaml
 
 # uang sungguhan — hanya setelah paham §5 dan §6
 PX_LIVE_TRADING=1 pxs trade --config configs/live.mini100.yaml --i-understand-the-risk
+```
+
+
+## 8. Cara termudah: `pxs risk`
+
+Tidak perlu mengedit file atau hafal nama variabel.
+
+```bash
+pxs risk show                                   # lihat semua guard + artinya
+pxs risk set max_intraday_loss_pct=2.5          # ubah satu
+pxs risk set max_total_loss_pct=10 max_daily_trades=6
+pxs risk set max_intraday_loss_pct=0            # 0 = matikan rem
+pxs risk set max_intraday_loss_pct=2.5 --dry-run  # lihat dulu, jangan tulis
+```
+
+Contoh keluaran `pxs risk show`:
+
+```
+┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ setting               ┃     value ┃ what it does                            ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ max_intraday_loss_pct │        2% │ pause until UTC rollover (~4.0 stops)   │
+│ max_daily_loss_pct    │        3% │ kill switch for the day                 │
+│ max_total_loss_pct    │       10% │ PERMANENT kill switch, from the deposit │
+│ risk_per_trade_pct    │      0.5% │ size per trade, to the stop             │
+│ max_leverage          │       10x │ position ceiling                        │
+└───────────────────────┴───────────┴─────────────────────────────────────────┘
+intraday brake = 4.0 stops
+```
+
+Jaminan `pxs risk set`:
+
+| Jaminan | Cara diuji |
+|---|---|
+| Hanya baris yang Anda sebut yang berubah | diff satu baris per setelan |
+| Semua komentar tetap | jumlah `#` sama; tes khusus |
+| Hasil wajib bisa di-parse, kalau tidak file tidak disentuh | tes "refused edit must not touch the file" |
+| Nama field salah → ditolak + daftar field yang benar | tes `unknown_field_lists_the_real_ones` |
+| Nilai salah tipe → ditolak | `max_intraday_loss_pct=dua` → `refused` |
+| Rem < 3 stop → peringatan | `warning: the intraday brake is now 1.0 stops` |
+
+Kenapa bukan `yaml.dump`: fungsi itu membuang **seluruh komentar** di file —
+dan komentar di `live.mini100.yaml` adalah alasan di balik angka yang melindungi
+deposit. Jadi nilainya ditulis sebagai teks, bukan di-serialisasi ulang.
+
+Kalau Anda mengubah `max_intraday_loss_pct`, ingat hubungannya:
+
+```
+max_intraday_loss_pct ÷ risk_per_trade_pct = jumlah stop yang muat
+2.0% ÷ 0.5% = 4 stop     <- preset sekarang
+0.75% ÷ 0.5% = 1.5 stop  <- preset lama: satu kerugian normal + slippage = berhenti
 ```

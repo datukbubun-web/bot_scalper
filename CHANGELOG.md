@@ -188,3 +188,18 @@ not the constraint — the absence of edge is.
   disabled flag, hand-declared windows, kill-switch latching, `initial_equity`
   write-once, `min_equity`, and the shipped preset's sizing under the leverage
   cap. Suite: **144 passed**.
+
+### Added — `pxs risk show` / `pxs risk set`
+Tuning the guards no longer means editing YAML by hand or remembering variable
+names. `pxs risk show` explains what each limit does and how many stops the
+intraday brake is worth; `pxs risk set max_intraday_loss_pct=2.5` rewrites just
+that line.
+
+`ops/config_edit.py` edits the file as **text**, because `yaml.safe_load` +
+`yaml.dump` deletes every comment — and in `live.mini100.yaml` the comments are
+the reasoning behind the numbers that protect the deposit. Every edit is
+re-parsed and pushed through `RiskConfig.from_dict` *before* it is written, so a
+typo is refused at the terminal instead of at 3 a.m. Tests (14) cover: one-line
+diff, comment preservation, insert-into-block, refused-edit-leaves-file-untouched,
+unknown-field listing, float/bool/tuple coercion, integer settings staying ints,
+and the "2% is four stops" explanation.

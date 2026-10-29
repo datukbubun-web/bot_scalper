@@ -276,6 +276,97 @@ def catalogue(
     )
 
 
+risk_app = typer.Typer(add_completion=False, help="Inspect and tune the risk guards.")
+app.add_typer(risk_app, name="risk")
+
+
+@risk_app.command("show")
+def risk_show(
+    config: str = typer.Option("configs/live.mini100.yaml", "--config", "-c"),
+    env: bool = typer.Option(True, help="include PX_RISK_* environment overrides"),
+) -> None:
+    """Show the guards that decide whether the bot may trade.
+
+    Read this before touching a number: the four loss limits do different
+    things, and confusing them is how a small account dies.
+    """
+    _bootstrap()
+    from .ops.config_edit import describe, read_effective
+
+    if not Path(config).exists():
+        console.print(f"[red]{config} not found[/red]")
+        raise typer.Exit(2)
+    cfg = read_effective(config, allow_env=env)
+    table = Table(title=f"risk guards — {config}", show_header=True, header_style="bold")
+    table.add_column("setting")
+    table.add_column("value", justify="right")
+    table.add_column("what it does")
+    for name, value, meaning in describe(cfg):
+        table.add_row(name, value, meaning)
+    console.print(table)
+    if cfg.max_intraday_loss_pct and cfg.risk_per_trade_pct:
+        stops = cfg.max_intraday_loss_pct / cfg.risk_per_trade_pct
+        style = "green" if stops >= 3 else "red"
+        console.print(
+            f"[{style}]intraday brake = {stops:.1f} stops[/{style}]"
+            + ("" if stops >= 3 else "  <- less than 3 stops: one bad bar halts trading")
+        )
+
+
+@risk_app.command("set")
+def risk_set(
+    assignments: list[str] = typer.Argument(
+        ..., help="FIELD=VALUE, e.g. max_intraday_loss_pct=2.5"
+    ),
+    config: str = typer.Option("configs/live.mini100.yaml", "--config", "-c"),
+    dry_run: bool = typer.Option(False, help="print the result, do not write"),
+) -> None:
+    """Change a guard in the YAML, keeping every comment in the file.
+
+        pxs risk set max_intraday_loss_pct=2.5
+        pxs risk set max_total_loss_pct=10 max_daily_trades=6
+    """
+    _bootstrap()
+    from .ops.config_edit import ConfigEditError, read_risk, set_values, summarise
+
+    if not Path(config).exists():
+        console.print(f"[red]{config} not found[/red]")
+        raise typer.Exit(2)
+
+    updates: dict[str, str] = {}
+    for item in assignments:
+        field, sep, value = item.partition("=")
+        if not sep:
+            console.print(f"[red]'{item}' is not FIELD=VALUE[/red]")
+            raise typer.Exit(2)
+        updates[field.strip()] = value.strip()
+
+    try:
+        if dry_run:
+            from .ops.config_edit import coerce, format_value
+
+            current = read_risk(config)
+            console.print("[yellow]dry run — nothing written[/yellow]")
+            for k, v in updates.items():
+                console.print(f"  {k}: {current.get(k)!r} -> {format_value(coerce(k, v))}")
+            raise typer.Exit(0)
+        changes = set_values(config, updates)
+    except ConfigEditError as exc:
+        console.print(f"[red]refused:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    console.print(f"[green]updated {config}[/green]\n{summarise(changes)}")
+    cfg = read_risk(config)
+    if "max_intraday_loss_pct" in updates and float(cfg.get("risk_per_trade_pct", 0) or 0) > 0:
+        stops = float(cfg["max_intraday_loss_pct"]) / float(cfg["risk_per_trade_pct"])
+        if stops < 3:
+            console.print(
+                f"[yellow]warning: the intraday brake is now {stops:.1f} stops — "
+                f"a single normal loss can halt trading for the day[/yellow]"
+            )
+    console.print("check it with: pxs risk show --config " + config)
+
+
 @app.command()
 def reconcile() -> None:
     """Compare the local journal with the exchange and fix drift."""
