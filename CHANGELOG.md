@@ -266,3 +266,24 @@ and the file says so.
 Tests: 13 in `tests/test_position_limits.py`, including the regression that fails
 on the old code (two $900 positions against a $1,000 ceiling must block) and a
 check that a free position slot never overrides a full exposure budget.
+
+### Added — one instrument only, enforced
+`risk.single_symbol` + `risk.allowed_symbols`. Previously a single symbol was
+just the default value of a list, so the next person to edit `symbols:` would
+change the bot's behaviour by accident. Now the runner refuses to start with
+two symbols when the scope says one, and `RiskEngine.evaluate()` refuses an order
+for any symbol outside the allow-list — checked before any other guard, so the
+refusal reason is the real one.
+
+### Fixed — every preset silently traded EUR/USD
+`build_engine()` read `raw["live"]["symbols"]`, but every example and preset puts
+`symbols` at the **top level**. The lookup always missed and fell through to the
+`LiveConfig` default of `EUR/USD`. So `pxs trade --config
+configs/live.mini100.yaml` ran **EUR/USD** while the file, the docs and the risk
+block all said XAU/USD — a config that said one instrument traded another. Both
+layouts are supported now, top level first, and a config with no symbols raises
+instead of quietly defaulting.
+
+Tests: 14 in `tests/test_single_symbol.py` (200 total), including the regression
+for the top-level `symbols` bug and a check that the scope guard is evaluated
+before the other guards.

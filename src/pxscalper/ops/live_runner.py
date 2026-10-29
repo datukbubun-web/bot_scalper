@@ -62,8 +62,19 @@ def build_engine(
 
     # --------------------------------------------------------------- config
     live_raw = raw.get("live", {})
+    # The examples (and every preset we ship) put `symbols` at the TOP level, but
+    # this read from `raw["live"]["symbols"]` -- so every preset silently fell
+    # back to its default of EUR/USD. Configuring the bot with a preset traded a
+    # different instrument than the preset named. Support both layouts, top level
+    # first, and never guess silently.
+    symbols_raw = live_raw.get("symbols", raw.get("symbols"))
+    if not symbols_raw:
+        raise RuntimeError(
+            "no symbols configured: set top-level `symbols: [\"XAU/USD\"]` "
+            "or `live.symbols`"
+        )
     live_cfg = LiveConfig(
-        symbols=live_raw.get("symbols", ["EUR/USD"]),
+        symbols=list(symbols_raw),
         bar_size=live_raw.get("bar_size", "1M"),
         lookback=int(live_raw.get("lookback", 64)),
         warmup_bars=int(live_raw.get("warmup_bars", 900)),
@@ -75,6 +86,33 @@ def build_engine(
         log_path=str(paths.logs / "decisions.jsonl"),
     )
     risk_cfg = RiskConfig.from_dict(raw.get("risk", {}))
+    symbols = list(live_cfg.symbols)
+
+    # ---- instrument scope -------------------------------------------------
+    # `symbols: [XAU/USD]` is a default, not a rule: the next person to add a
+    # second instrument changes the bot's behaviour by accident. If the risk
+    # block says one instrument, refuse to start with more than one instead of
+    # quietly trading both.
+    if risk_cfg.single_symbol:
+        if len(symbols) != 1:
+            raise RuntimeError(
+                f"risk.single_symbol is true but live.symbols has {len(symbols)} "
+                f"entries {symbols}. Leave exactly one, or set single_symbol: false."
+            )
+        if not risk_cfg.allowed_symbols:
+            risk_cfg.allowed_symbols = [symbols[0]]
+        elif risk_cfg.allowed_symbols != symbols:
+            raise RuntimeError(
+                f"risk.allowed_symbols {risk_cfg.allowed_symbols} does not match "
+                f"live.symbols {symbols}"
+            )
+    elif risk_cfg.allowed_symbols:
+        outside = [s for s in symbols if s not in risk_cfg.allowed_symbols]
+        if outside:
+            raise RuntimeError(
+                f"live.symbols contains {outside}, which risk.allowed_symbols "
+                f"{risk_cfg.allowed_symbols} forbids"
+            )
     exec_cfg = ExecutionConfig(
         dry_run=not allow_live,
         **{k: v for k, v in raw.get("execution", {}).items()

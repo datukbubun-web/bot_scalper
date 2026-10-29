@@ -27,6 +27,9 @@ strategy:
   size_by_edge: false
 
 risk:
+  single_symbol: true
+  allowed_symbols: ["XAU/USD"]
+
   risk_per_trade_pct: 0.5
   max_positions: 10              # <-- ubah angka ini sesuai keinginan (1..10)
   max_positions_per_symbol: 1     # <-- 1 = satu taruhan per simbol

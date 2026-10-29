@@ -107,6 +107,13 @@ class RiskDecision(str, Enum):
 class RiskConfig:
     # sizing
     risk_per_trade_pct: float = 0.25      # of equity, to the stop distance
+    # ---- instrument scope ---------------------------------------------------
+    # One instrument only, by default. A scalper's edge (if any) lives in one
+    # market at one cost structure; splitting attention and capital across
+    # several is how a small account ends up paying several spreads for one
+    # idea. Enforced in evaluate() as well as at config load.
+    single_symbol: bool = False
+    allowed_symbols: list[str] = field(default_factory=list)
     max_positions: int = 2
     # Ten open positions in ONE symbol is not diversification, it is the same
     # bet at 10x the size. Cap per symbol as well as in total.
@@ -505,6 +512,24 @@ class RiskEngine:
                     f"equity {equity:.2f} below the configured minimum {cfg.min_equity:.2f}",
                 )
 
+        # 0c. instrument scope --------------------------------------------------
+        # Checked before anything else that costs money: an order for an
+        # instrument outside the allow-list is refused regardless of how good
+        # the setup looks.
+        if cfg.allowed_symbols:
+            checks["symbol_allowed"] = symbol in cfg.allowed_symbols
+            if not checks["symbol_allowed"]:
+                return verdict(
+                    RiskDecision.BLOCK,
+                    f"{symbol} is not in allowed_symbols {cfg.allowed_symbols}",
+                )
+        if cfg.single_symbol and cfg.allowed_symbols and len(cfg.allowed_symbols) > 1:
+            return verdict(
+                RiskDecision.BLOCK,
+                f"single_symbol is on but {len(cfg.allowed_symbols)} symbols are "
+                f"allowed: {cfg.allowed_symbols}",
+            )
+
         checks["kill_switch"] = not self.kill.engaged()
         if not checks["kill_switch"]:
             return verdict(RiskDecision.BLOCK, "kill switch engaged")
@@ -562,6 +587,8 @@ class RiskEngine:
         checks["max_positions"] = len(positions) < cfg.max_positions
         if not checks["max_positions"]:
             return verdict(RiskDecision.BLOCK, f"max positions ({cfg.max_positions}) reached")
+        # With a single instrument, N positions in it is N times one bet -- so
+        # the per-symbol cap is what limits the account, not max_positions.
         checks["max_positions_per_symbol"] = (
             len(same_symbol) < cfg.max_positions_per_symbol
         )

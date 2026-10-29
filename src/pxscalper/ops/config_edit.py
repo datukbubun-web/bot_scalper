@@ -204,6 +204,13 @@ def describe(cfg: RiskConfig, stops_at_pct: float | None = None) -> list[tuple[s
     rows.append(("max_daily_trades", str(cfg.max_daily_trades), "trade budget per UTC day"))
     rows.append(
         (
+            "symbols",
+            ", ".join(cfg.allowed_symbols) if cfg.allowed_symbols else "any",
+            "single instrument only" if cfg.single_symbol else "scope not enforced",
+        )
+    )
+    rows.append(
+        (
             "max_positions",
             str(cfg.max_positions),
             f"open at once (max {cfg.max_positions_per_symbol} per symbol)",
