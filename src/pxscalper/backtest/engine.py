@@ -64,6 +64,22 @@ class BacktestConfig:
     periods_per_year: int = 1440 * 252
     max_positions: int = 1
     compound: bool = True
+    #: Equity base for compounding: "continuous" (every trade), "daily" (re-compound
+    #: once per UTC rollover), or "fixed" (no compounding; flat initial_equity).
+    compound_mode: str = "continuous"
+    #: Daily profit lock (% of day_start_equity). >0 locks entries for the rest of
+    #: the UTC day once reached.
+    daily_profit_target_pct: float = 0.0
+    #: When True and daily_profit_target_pct > 0, intrabar profit reaching the daily
+    #: target automatically harvests (closes) the open position at that level.
+    harvest_daily_profit_target: bool = False
+    #: Optional daily loss brake (% of day_start_equity) matching live RiskEngine.
+    max_daily_loss_pct: float = 0.0
+    #: Anti-Martingale drawdown throttle matching live RiskEngine.
+    compound_dd_scale: bool = False
+    dd_scale_start_pct: float = 4.0
+    dd_scale_min_factor: float = 0.35
+    max_drawdown_pct: float = 25.0
     # live-equivalent position caps: the backtest must not be able to take a
     # size the risk engine would never allow in production.
     max_leverage: float = 5.0
@@ -127,6 +143,7 @@ class BacktestResult:
             "── backtest summary ────────────────────────────────",
             f"  trades              {m.get('n_trades', 0):,.0f}",
             f"  net return          {m.get('total_return_pct', 0):+.2f} %",
+            f"  compounded / day    {m.get('compounded_daily_pct', 0):+.2f} %",
             f"  annualised          {m.get('annual_return_pct', 0):+.2f} %",
             f"  Sharpe              {m.get('sharpe', 0):.2f}",
             f"  Sortino             {m.get('sortino', 0):.2f}",
@@ -185,6 +202,10 @@ class Backtester:
         rows = [int(i) for i in window_end_idx]
 
         equity = cfg.initial_equity
+        peak_equity = cfg.initial_equity
+        current_utc_day: int | None = None
+        day_start_equity = cfg.initial_equity
+        eff_mode = "fixed" if not cfg.compound else str(cfg.compound_mode).strip().lower()
         result = BacktestResult(config=cfg.to_dict())
         position: dict[str, Any] | None = None
         last_exit_time = 0
@@ -192,6 +213,10 @@ class Backtester:
         for row, bar_idx in enumerate(rows):
             if bar_idx < 1 or bar_idx >= len(close) - 1:
                 continue
+            utc_day = int(times[bar_idx]) // 86_400_000
+            if utc_day != current_utc_day:
+                current_utc_day = utc_day
+                day_start_equity = equity
             window = windows[row]
             price_risk = max(atr[bar_idx], close[bar_idx] * 1e-6)
 
@@ -204,6 +229,29 @@ class Backtester:
                 reason = ""
                 side = position["side"]
                 target = position.get("target") if cfg.tp_atr > 0 else None
+                if (
+                    cfg.harvest_daily_profit_target
+                    and cfg.daily_profit_target_pct > 0
+                    and day_start_equity > 0
+                    and position["qty"] > 0
+                ):
+                    need_net = (
+                        day_start_equity * (1.0 + cfg.daily_profit_target_pct / 100.0)
+                        - equity
+                        + position["entry_fee"]
+                    )
+                    if need_net > 0:
+                        fee_factor = max(1.0 - side * cfg.taker_fee_pct / 100.0, 1e-6)
+                        dp_px = (
+                            position["entry_price"]
+                            + side * (need_net / max(position["qty"] * coeff * fee_factor, 1e-12))
+                        )
+                        if (
+                            target is None
+                            or (side > 0 and dp_px < target)
+                            or (side < 0 and dp_px > target)
+                        ):
+                            target = float(dp_px)
 
                 stop_hit = (side > 0 and lo <= position["stop"]) or (
                     side < 0 and hi >= position["stop"]
@@ -271,11 +319,24 @@ class Backtester:
                     )
                     result.trades.append(trade)
                     equity = equity_now
+                    peak_equity = max(peak_equity, equity)
                     position = None
                     last_exit_time = int(times[bar_idx])
 
             # ------------------------------------------------------------ entries
-            if position is None and row > 0:
+            day_pnl_pct = (
+                (equity - day_start_equity) / max(day_start_equity, 1e-9) * 100.0
+                if day_start_equity > 0
+                else 0.0
+            )
+            day_locked = (
+                cfg.daily_profit_target_pct > 0
+                and day_pnl_pct >= cfg.daily_profit_target_pct - 1e-9
+            ) or (
+                cfg.max_daily_loss_pct > 0
+                and day_pnl_pct <= -cfg.max_daily_loss_pct
+            )
+            if position is None and row > 0 and not day_locked:
                 sig_out = signal_fn(row, window)
                 if len(sig_out) == 4:
                     direction, conf, edge, exec_meta = sig_out  # type: ignore[misc]
@@ -300,12 +361,32 @@ class Backtester:
                     eff_sl_atr = max(cfg.sl_atr * sl_mult, 1e-6)
                     eff_tp_atr = cfg.tp_atr * tp_mult if cfg.tp_atr else 0.0
                     eff_hold = max(1, int(round(cfg.max_holding_bars * hold_mult)))
+                    if eff_mode == "daily":
+                        sizing_equity = min(day_start_equity, equity)
+                    elif eff_mode == "fixed":
+                        sizing_equity = min(cfg.initial_equity, equity)
+                    else:
+                        sizing_equity = equity
+                    eff_risk_pct = cfg.risk_per_trade_pct
+                    if cfg.compound_dd_scale and peak_equity > 0:
+                        dd_now = (peak_equity - equity) / peak_equity * 100.0
+                        if dd_now > cfg.dd_scale_start_pct:
+                            span = max(cfg.max_drawdown_pct - cfg.dd_scale_start_pct, 1.0)
+                            dd_factor = max(
+                                cfg.dd_scale_min_factor,
+                                1.0
+                                - (dd_now - cfg.dd_scale_start_pct)
+                                / span
+                                * (1.0 - cfg.dd_scale_min_factor),
+                            )
+                            eff_risk_pct = cfg.risk_per_trade_pct * dd_factor
                     # risk-based sizing: risk_amount / (stop_distance * pnl_coefficient)
-                    risk_amount = equity * (cfg.risk_per_trade_pct * size_mult) / 100.0
+                    risk_amount = sizing_equity * (eff_risk_pct * size_mult) / 100.0
                     qty = risk_amount / max(eff_sl_atr * price_risk * coeff, 1e-12)
                     # cap notional by leverage / gross exposure (as the live engine does)
                     max_notional = min(
-                        equity * cfg.max_leverage, equity * cfg.max_gross_exposure_pct / 100.0
+                        sizing_equity * cfg.max_leverage,
+                        sizing_equity * cfg.max_gross_exposure_pct / 100.0,
                     )
                     qty = min(qty, max_notional / max(raw_price * coeff, 1e-9))
                     if cfg.qty_step > 0:
@@ -364,8 +445,10 @@ class Backtester:
                 bars_per_day = max(1.0, 86_400_000.0 / dt_ms)
                 periods_per_year = bars_per_day * 252.0
         n_years = len(rets) / periods_per_year
+        n_sessions = max(len(rets) / max(periods_per_year / 252.0, 1.0), 1e-9)
         total_return = equity[-1] / equity[0] - 1
         annual = (1 + total_return) ** (1 / max(n_years, 1e-9)) - 1 if total_return > -1 else -1.0
+        compounded_daily = (1 + total_return) ** (1 / n_sessions) - 1 if total_return > -1 else -1.0
         std = rets.std()
         sharpe = float(rets.mean() / std * math.sqrt(periods_per_year)) if std > 0 else 0.0
         downside = rets[rets < 0]
@@ -388,6 +471,7 @@ class Backtester:
         return {
             "n_trades": float(len(trades)),
             "total_return_pct": total_return * 100,
+            "compounded_daily_pct": compounded_daily * 100,
             "annual_return_pct": annual * 100,
             "sharpe": sharpe,
             "sortino": sortino,

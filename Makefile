@@ -1,4 +1,4 @@
-.PHONY: install install-dev test lint fmt smoke doctor data bias train-xau train-tcn train-lstm train-transformer train-ppo train-sac export calibrate backtest backtest-oos paper live push
+.PHONY: install install-dev test lint fmt smoke doctor data bias compound train-xau train-tcn train-lstm train-transformer train-ppo train-sac export calibrate backtest backtest-oos paper live push
 
 install:
 	pip install -e .
@@ -26,6 +26,9 @@ data:             ## download historical bars into data/
 
 bias:             ## inspect causal Hybrid Intraday Bias + Scalper state
 	python -m pxscalper.cli bias --symbol XAU/USD --bars 5M --htf 15M
+
+compound:         ## run OOS compounding verification & 3%/day projection table
+	python -m pxscalper.cli compound --config configs/live.hybrid.compound.yaml --days 30
 
 train-xau:        ## train, calibrate, export & OOS-verify all XAU/USD Hybrid + single-TF models
 	python scripts/training/train_xau.py --bars ALL

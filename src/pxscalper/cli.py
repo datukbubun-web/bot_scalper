@@ -212,6 +212,121 @@ def backtest(
 
 
 @app.command()
+def compound(
+    config: str = typer.Option(
+        "configs/live.hybrid.compound.yaml",
+        "--config",
+        "-c",
+        help="compounding preset YAML",
+    ),
+    equity: float = typer.Option(
+        0.0, "--equity", help="override starting equity (0 = use config initial_equity)"
+    ),
+    target_daily_pct: float = typer.Option(
+        3.0, "--target-daily-pct", help="daily compounding rate (%) for projection table"
+    ),
+    days: int = typer.Option(30, "--days", help="number of trading days to project"),
+    oos_frac: float = typer.Option(0.40, "--oos-frac", help="OOS slice fraction for empirical check"),
+) -> None:
+    """Evaluate empirical OOS compounding and project compounded equity + lot scaling."""
+    _bootstrap()
+    import tempfile
+    import yaml
+    from .ops.backtest_runner import run_backtest_from_config
+
+    cfg_path = Path(config)
+    if not cfg_path.exists():
+        console.print(f"[red]{config} not found[/red]")
+        raise typer.Exit(2)
+
+    raw = yaml.safe_load(cfg_path.read_text()) or {}
+    if equity > 0:
+        raw.setdefault("backtest", {})["initial_equity"] = float(equity)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tf:
+            yaml.safe_dump(raw, tf)
+            run_path = Path(tf.name)
+        try:
+            res = run_backtest_from_config(run_path, oos_frac=oos_frac)
+        finally:
+            run_path.unlink(missing_ok=True)
+        start_eq = float(equity)
+    else:
+        res = run_backtest_from_config(cfg_path, oos_frac=oos_frac)
+        start_eq = float(
+            (raw.get("backtest") or {}).get(
+                "initial_equity", 100.0 if "mini100" in cfg_path.name else 10_000.0
+            )
+        )
+
+    m = res.metrics
+    risk_raw = raw.get("risk") or {}
+    risk_pct = float(risk_raw.get("risk_per_trade_pct", 0.5))
+    max_lev = float(risk_raw.get("max_leverage", 5.0))
+    cmode = str(risk_raw.get("compound_mode", "continuous"))
+    dtgt = float(risk_raw.get("daily_profit_target_pct", 0.0))
+    from .utils import bar_ms
+
+    bs = str((raw.get("live") or {}).get("bar_size", raw.get("bar_size", "5M")))
+    bpd = max(1.0, 86_400_000.0 / bar_ms(bs))
+    eval_bars = len(res.equity_curve) * (oos_frac if 0 < oos_frac < 1.0 else 1.0)
+    oos_sessions = max(eval_bars / bpd, 1.0)
+    final_eq = float(m.get("final_equity", start_eq))
+    oos_comp_daily = ((final_eq / max(start_eq, 1e-9)) ** (1.0 / oos_sessions) - 1.0) * 100.0
+
+    emp = Table(
+        title=f"Hasil Empiris OOS Compounding ({oos_frac:.0%} Unseen Data, {oos_sessions:.1f} Sesi Bursa) — {config}",
+        show_header=True,
+        header_style="bold",
+    )
+    emp.add_column("metric")
+    emp.add_column("value", justify="right")
+    emp.add_row("modal awal", f"${start_eq:,.2f}")
+    emp.add_row("modal akhir OOS", f"${final_eq:,.2f}")
+    emp.add_row("total net return OOS", f"{m.get('total_return_pct', 0.0):+.2f}%")
+    emp.add_row("rata-rata majemuk / hari bursa OOS", f"{oos_comp_daily:+.2f}% / hari")
+    emp.add_row("max drawdown OOS", f"{m.get('max_drawdown_pct', 0.0):.2f}%")
+    emp.add_row("Sharpe / Profit Factor", f"{m.get('sharpe', 0.0):.2f} / {m.get('profit_factor', 0.0):.2f}")
+    emp.add_row("win rate / jumlah trade", f"{m.get('win_rate_pct', 0.0):.1f}% ({int(m.get('n_trades', 0))} trades)")
+    emp.add_row(
+        "mode compound",
+        f"{cmode} | risk={risk_pct:g}% | maxLev={max_lev:g}x | dailyLock={dtgt:g}%",
+    )
+    console.print(emp)
+
+    proj = Table(
+        title=f"Simulasi Compound {target_daily_pct:g}%/Hari Bursa (Modal Awal ${start_eq:,.2f})",
+        show_header=True,
+        header_style="bold",
+    )
+    proj.add_column("hari bursa", justify="right")
+    proj.add_column("ekuitas majemuk", justify="right")
+    proj.add_column("target profit hari itu", justify="right")
+    proj.add_column("risiko / trade", justify="right")
+    proj.add_column("est. lot XAU/USD (~$22 stop)", justify="right")
+    milestones = sorted({1, 5, 10, 15, 20, 25, days})
+    milestones = [d for d in milestones if 1 <= d <= max(days, 1)]
+    for d in milestones:
+        eq_d = start_eq * ((1.0 + target_daily_pct / 100.0) ** d)
+        eq_prev = start_eq * ((1.0 + target_daily_pct / 100.0) ** (d - 1))
+        day_profit = eq_d - eq_prev
+        risk_usd = eq_prev * (risk_pct / 100.0)
+        est_oz = max(0.01, round((risk_usd / 22.0) // 0.01 * 0.01, 2))
+        proj.add_row(
+            f"Hari ke-{d}",
+            f"${eq_d:,.2f}",
+            f"+${day_profit:,.2f}",
+            f"${risk_usd:,.2f}",
+            f"{est_oz:.2f} oz",
+        )
+    console.print(proj)
+    console.print(
+        "[yellow]Catatan Risiko Realistis:[/yellow] Target 3%/hari majemuk membutuhkan leverage tinggi "
+        "dan disiplin ketat; tidak semua hari bursa memunculkan sinyal dislokasi, dan seri "
+        "stop-loss beruntun menghasilkan drawdown proporsional terhadap risk_per_trade_pct."
+    )
+
+
+@app.command()
 def orderbook(
     symbol: str = typer.Option("XAU/USD", help="symbol to probe"),
     ladder: str = typer.Option("0.01,0.1,1,10,50", help="comma-separated size ladder"),
@@ -522,12 +637,23 @@ def risk_show(
     for name, value, meaning in describe(cfg):
         table.add_row(name, value, meaning)
     top = read_top_level(config)
+    basket_val = (
+        f"{top['close_all_on_profit_pct']:g}% eq"
+        if top.get("close_all_on_profit_pct", 0) > 0
+        else f"${top['close_all_on_profit']:g}"
+    )
     table.add_row(
         "close_all_on_profit",
-        f"${top['close_all_on_profit']:g}",
+        basket_val,
         "close ALL when basket profit hits this"
         + ("" if top["close_all_enforce"] else " (report only!)"),
     )
+    if top.get("harvest_daily_profit_target"):
+        table.add_row(
+            "harvest_daily_profit_target",
+            "true",
+            "auto-close open positions once daily_profit_target_pct reached",
+        )
     console.print(table)
     if cfg.max_intraday_loss_pct and cfg.risk_per_trade_pct:
         stops = cfg.max_intraday_loss_pct / cfg.risk_per_trade_pct

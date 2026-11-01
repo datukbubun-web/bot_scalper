@@ -67,9 +67,11 @@ class LiveConfig:
     # positions in one symbol): the account target is what the operator asked
     # for, and waiting for every leg's own take-profit means giving the profit
     # back while the losers stay open.
-    close_all_on_profit: float = 0.0     # 0 disables
+    close_all_on_profit: float = 0.0     # 0 disables (fixed account currency)
+    close_all_on_profit_pct: float = 0.0 # >0 compounds basket target as % of equity
     close_all_enforce: bool = False      # False = report only (paper observation)
     close_all_cooldown_s: float = 300.0  # re-arm delay after firing
+    harvest_daily_profit_target: bool = False  # close open positions once daily_profit_target_pct hit
     # ---- synthetic L2 depth probing -----------------------------------------
     l2_probe_interval_s: float = 0.0     # >0 probes /orders/market/impact ladder
     l2_probe_ladder: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0)
@@ -120,6 +122,7 @@ class LiveEngine:
         self._running = False
         self._basket = BasketTarget(
             config.close_all_on_profit,
+            target_pct=config.close_all_on_profit_pct,
             cooldown_s=config.close_all_cooldown_s,
             clock=self._clock,
         )
@@ -259,10 +262,11 @@ class LiveEngine:
                 if now - self._last_settings_refresh >= self.config.refresh_settings_s:
                     self._refresh_settings(force=True)
 
-                # Basket target is checked every cycle, not per bar: profit can
-                # peak between bars and giving it back while waiting for a bar
-                # close is exactly what this rule exists to prevent.
-                if self._check_basket_target(positions):
+                # Basket target & daily compounding profit harvest are checked every cycle:
+                # profit can peak between bars and locking in the target is why these exist.
+                if self._check_daily_profit_harvest(positions, equity=account.equity):
+                    positions = self.client.positions()
+                elif self._check_basket_target(positions, equity=account.equity):
                     positions = self.client.positions()
 
                 for symbol in self.config.symbols:
@@ -720,8 +724,46 @@ class LiveEngine:
                 self._after_close(prev, syn_res, pnl_override=realized_pnl)
         self._known_positions = current_by_id
 
-    # ------------------------------------------------------- basket target
-    def _check_basket_target(self, positions: list[Position]) -> bool:
+    # ------------------------------------------------------- basket & daily harvest
+    def _check_daily_profit_harvest(self, positions: list[Position], equity: float = 0.0) -> bool:
+        """Close all open positions once total daily equity gain hits daily_profit_target_pct."""
+        target_pct = self.risk.config.daily_profit_target_pct
+        day_start = self.risk.state.day_start_equity
+        if (
+            not positions
+            or not self.config.harvest_daily_profit_target
+            or target_pct <= 0
+            or day_start <= 0
+            or equity <= 0
+        ):
+            return False
+        day_gain_pct = (equity - day_start) / day_start * 100.0
+        if day_gain_pct < target_pct - 1e-9:
+            return False
+        log.warning(
+            "DAILY PROFIT TARGET HIT +%.2f%% >= +%.2f%% (day_start=%.2f, equity=%.2f) -> harvesting %d position(s)",
+            day_gain_pct, target_pct, day_start, equity, len(positions),
+        )
+        self.audit.write(
+            "daily_profit_target_hit",
+            day_gain_pct=day_gain_pct,
+            target_pct=target_pct,
+            day_start_equity=day_start,
+            equity=equity,
+            positions=len(positions),
+        )
+        closed = 0
+        for pos in positions:
+            result = self.router.close_position(pos, reason=f"daily profit target +{target_pct:g}%")
+            self._after_close(pos, result)
+            if result.ok:
+                closed += 1
+            else:
+                log.error("daily harvest close failed for %s: %s", pos.id, result.error)
+                return False
+        return closed > 0
+
+    def _check_basket_target(self, positions: list[Position], equity: float = 0.0) -> bool:
         """Close every position when the combined PnL reaches the target.
 
         Returns True when a close-all was issued. Closing is done position by
@@ -729,10 +771,10 @@ class LiveEngine:
         per-position audit trail, and an audit trail is the only way to explain
         afterwards why a losing leg was closed.
         """
-        if not positions or self.config.close_all_on_profit <= 0:
+        if not positions or self._basket.effective_target(equity) <= 0:
             return False
         verdict = self._basket.evaluate(
-            positions, enforce=self.config.close_all_enforce
+            positions, enforce=self.config.close_all_enforce, equity=equity
         )
         if verdict.triggered and not self.config.close_all_enforce:
             self.audit.write("basket_target_report_only", **verdict.to_dict())
