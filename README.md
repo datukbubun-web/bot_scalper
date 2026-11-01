@@ -1,225 +1,334 @@
-# pxscalper — FX Scalping Stack for PrimeXBT
+# pxscalper — Hybrid Intraday Bias + Scalper Stack untuk PrimeXBT
 
-## Artefak model & cache data yang ikut di repo
+Bot trading algoritmik **Arsitektur Hybrid 2-Lapis (`Intraday Bias + Scalper Execution`)** untuk PrimeXBT API v3 (`XAU/USD`, FX, dan CFD), didukung **Antisymmetric MTF Skip-TCN / LSTM-GRU / PatchTST-lite + PPO/SAC**, inferensi latensi rendah **ONNX Runtime (~103–111 µs p50)**, **Synthetic L2 Order Book**, risk engine berlapis yang tidak bisa ditawar model, serta eksekusi kausal yang memeriksa dampak likuiditas sebelum mengirim order.
 
-Beberapa file biner **sengaja** ada di commit (di-*force add*, karena
-`.gitignore` mengabaikannya secara default). Ambil hanya yang Anda butuhkan.
+Mengapa **Arsitektur Hybrid**, bukan *pure scalper* satu timeframe?
+- **Layer 1 — Intraday Bias Engine (`15M` / `5M`)**: Menentukan arah struktural, nilai wajar lintas-logam (*Cross-Metal Fair-Value* `XAU/USD` vs `XAG/USD`), *Anchored Session VWAP* (`00:00 UTC`), *Volatility Regime Ratio*, dan *2H Efficiency Ratio* — sekaligus mem-veto entry melawan arus sesi, lonjakan volatilitas ekstrem, *macro event blackout* (`NFP`, `CPI`, `FOMC`), maupun jam *daily rollover* (`21:00–23:00 UTC`).
+- **Layer 2 — Scalper Execution Engine (`5M` / `1M`)**: Mengeksekusi *timing* entry presisi hanya ketika dislokasi mikro selaras dengan *Intraday Bias*, didukung gerbang statis ONNX pada **Antisymmetric Skip-TCN**, konfirmasi *1M candle wick-absorption* (`close_location`), serta verifikasi spread & *market impact*.
 
-| Path | Isi | Status & Catatan |
+> ⚠️ **Baca ini dulu.** Trading dengan leverage tinggi dapat menghabiskan seluruh modal Anda. Repo ini adalah *trading & research engine* — bukan jaminan profit dan bukan nasihat keuangan. Edge nyata berasal dari **penyelarasan bias struktural, disiplin biaya eksekusi, dan pembatasan risiko ketat**, bukan dari keajaiban model semata. Selalu jalankan mode `paper` dan uji di **akun DEMO** PrimeXBT minimal beberapa minggu sebelum mempertimbangkan dana sungguhan.
+
+---
+
+## Artefak Model, Preset Produksi & Verifikasi OOS di Repo
+
+Beberapa file biner model & cache historis **sengaja** disertakan di repositori (di-*force add* melewati `.gitignore` default) agar seluruh hasil *out-of-sample* (OOS) dapat langsung direproduksi tanpa mengunduh ulang.
+
+### 1. Artefak Model & Data
+
+| Path | Isi | Status & Catatan OOS (`60–100%` Tak Terlihat) |
 |---|---|---|
-| `artifacts/models/latest/`, `artifacts/xau_hybrid_5M/` | **Hybrid MTF Skip-TCN** (`15M Intraday Bias + Session VWAP + VolRegime + 5M Scalper Execution`) | Tervalidasi OOS (`60–100%` tak terlihat): **+5.27% net return**, **Sharpe +4.35**, **PF 2.01**, **Win Rate 64.9%**, **MaxDD 0.72%** pada `0.65 bps` (**+4.75% / Sharpe +3.96** pada *stress* 2x `1.30 bps`). |
-| `artifacts/xau_hybrid_1M/` | **Hybrid Micro-Scalper 1M** (`5M/15M Intraday Bias + 1M Wick-Absorption Micro-Execution`) | Tervalidasi OOS (`60–100%` pada `0.65 bps`): **+4.27% net return**, **Sharpe +3.62**, **PF 1.68**, **Win Rate 64.3%** (Blind Test **Win Rate 68.3%**), **MaxDD 0.83%**. |
-| `artifacts/xau_5M/`, `artifacts/xau_15M/` | Benchmark satu-timeframe XAU/USD 5M & 15M | Tervalidasi OOS (`60–100%` pada `0.65 bps`): `5M` **Sharpe +2.39**, `15M` **Sharpe +4.70**. Lihat `docs/XAUUSD_REPORT.md`. |
-| `artifacts/models/smoke/` | Model hasil uji smoke (data sintetis) | Khusus *plumbing self-test*, bukan untuk trading nyata. |
-| `data/*.parquet`, `data/*.csv.gz` | Cache bar (XAU/USD 1M/5M/15M, XAG/USD 1M/5M, EUR/GBP/USD, USD/CAD, USD/CHF, USD/JPY) | Data harga publik (~11 MB). Bisa diperbarui dengan `pxs data`. |
+| `artifacts/models/latest/`, `artifacts/xau_hybrid_5M/` | **Hybrid MTF Skip-TCN (`83×64`)** — `15M Intraday Bias + Session VWAP + VolRegime + 5M Scalper Execution` | **Default Produksi.** OOS (`0.65 bps`): **+5.27% net return** (`+20.70%` ann), **Sharpe +4.35**, **PF 2.01**, **Win Rate 64.94%**, **MaxDD 0.72%** (*stress* 2× biaya `1.30 bps`: **+4.75% / Sharpe +3.96 / PF 1.88**). |
+| `artifacts/xau_hybrid_1M/` | **Hybrid Micro-Scalper 1M (`74×64`)** — `5M/15M Intraday Bias + 1M Wick-Absorption Micro-Execution` | OOS (`0.65 bps`): **+4.27% net return** (`+16.47%` ann), **Sharpe +3.62**, **PF 1.68**, **Win Rate 64.29%** (*Blind Test* `80–100%`: **Win Rate 68.3%**, **Sharpe +2.67**), **MaxDD 0.83%**. |
+| `artifacts/xau_5M/`, `artifacts/xau_15M/` | Model pembanding satu-timeframe (`XAU/USD` `5M` & `15M`) | Benchmark pembanding *pure single-TF* (`5M` Sharpe `+2.39`, `15M` Sharpe `+4.70`). Rincian lengkap di `docs/XAUUSD_REPORT.md`. |
+| `artifacts/models/smoke/` | Model uji mandiri *smoke* (data sintetis) | Khusus *offline plumbing self-test*, **bukan** untuk trading nyata. |
+| `data/*.parquet`, `data/*.csv.gz` | Cache bar historis publik (`XAU/USD` `1M/5M/15M`, `XAG/USD` `1M/5M`, G10 FX `5M`) | Data publik PrimeXBT (~11 MB). Dapat diperbarui kapan saja via `pxs data`. |
 
-Reproduksi hasil training, inspeksi Intraday Bias, & verifikasi OOS Hybrid XAU/USD:
+### 2. Preset Konfigurasi Hybrid Siap Pakai (`configs/`)
+
+| Preset Konfigurasi | Target Akun & Mode | Hasil Backtest OOS (`--oos-frac 0.40`, Spread `0.65 bps`, Fee `0%`) |
+|---|---|---|
+| `configs/live.hybrid.yaml` | Standar `$10.000` (`15M Bias -> 5M Exec`, risiko `0.5%/trade`) | `n=77` \| Akhir `$10.527,11` (**+5.27%**) \| **Sharpe +4.35** \| **Calmar 28.81** \| **PF 2.01** \| **WR 64.94%** \| **MaxDD 0.72%** \| `+6.70 bps/trade` |
+| `configs/live.hybrid.1m.yaml` | Presisi Mikro `$10.000` (`5M/15M Bias -> 1M Wick Exec`, risiko `0.5%/trade`) | `n=84` \| Akhir `$10.427,44` (**+4.27%**) \| **Sharpe +3.62** \| **Calmar 19.73** \| **PF 1.68** \| **WR 64.29%** \| **MaxDD 0.83%** \| `+5.01 bps/trade` |
+| `configs/live.mini100.hybrid.yaml` | Akun Mini `$100` (`0.01 oz` XAU/USD, `15M Bias -> 5M Exec` + *safety guardrails*) | `n=77` \| Akhir `$103,89` (**+3.89%**) \| **Sharpe +3.91** \| **Calmar 23.60** \| **PF 1.89** \| **WR 64.94%** \| **MaxDD 0.64%** \| `+4.98 bps/trade` |
+
+Reproduksi penuh training, inspeksi *Intraday Bias*, & verifikasi OOS Hybrid XAU/USD:
+
 ```bash
 python3 scripts/training/train_xau.py --bars ALL
 pxs bias --symbol XAU/USD --bars 5M --htf 15M
+pxs bias --symbol XAU/USD --bars 1M --htf 15M
 pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40
 pxs backtest --config configs/live.hybrid.1m.yaml --oos-frac 0.40
 pxs backtest --config configs/live.mini100.hybrid.yaml --oos-frac 0.40
 ```
 
-`logs/` dan `state/` **kosong** saat commit ini dibuat, jadi tidak ada yang
-dipindahkan. Keduanya tetap di-`.gitignore` ke depan karena dapat berisi
-riwayat posisi dan kredensial.
-
-
-Bot scalping forex (dan CFD kripto) untuk PrimeXBT: **TCN / LSTM-GRU / PatchTST-style Transformer + PPO/SAC**, dengan inferensi **TorchScript / ONNX Runtime** di jalur panas, risk engine yang tidak bisa ditawar model, dan eksekusi yang memeriksa biaya sebelum mengirim order.
-
-> ⚠️ **Baca ini dulu.** Trading dengan leverage bisa menghabiskan seluruh modal Anda. Repo ini adalah *engine* — bukan jaminan profit, bukan nasihat keuangan. Tidak ada model deep learning yang bisa memprediksi FX dengan akurasi tinggi secara konsisten; edge yang realistis di scalping berasal dari **eksekusi, biaya, dan disiplin risiko**, bukan dari keajaiban arsitektur. Jalankan `paper` minimal beberapa minggu dan uji di **demo account** PrimeXBT sebelum uang sungguhan.
+`logs/` dan `state/` tetap diabaikan oleh `.gitignore` agar riwayat posisi, *risk state*, dan data akun tidak pernah bocor ke Git.
 
 ---
 
-## 1. Status & fakta penting (baca sebelum setup)
+## 1. Status & Fakta Teknis PrimeXBT v3 (Baca Sebelum Setup)
 
-| Hal | Kenyataan |
+| Aspek | Kenyataan di Lapangan & Penanganan `pxscalper` |
 |---|---|
-| **API PrimeXBT** | Trading API **v3** di `https://api.primexbt.com/v3/trading` — REST, **Ed25519** signing. Dokumentasi: <https://api.primexbt.com/docs/trading.html> |
-| **API key `pxk_...`** | Itu **key ID** (publik). Yang dipakai menandatangani request adalah **secret Ed25519 (PKCS#8, base64)** yang hanya ditampilkan sekali saat key dibuat. Tanpa secret, tidak ada request bertanda tangan yang bisa dibuat. |
-| **Websocket** | Belum ada di v3. Bot *polling* `quotes` / `positions` / `orders/active` dan tidak pernah lebih cepat dari ritme aksinya. |
-| **Order tidak idempoten** | Dokumentasi PrimeXBT: *"No request is safe to repeat. A placed order sent twice is two orders."* Karena itu tidak ada retry buta — lihat `execution/router.py` + `live/reconcile.py`. |
-| **Margin/hedge** | Mendukung `NETTING` dan `HEDGE`. Bot menangani keduanya, tetapi default-nya netting (satu posisi per instrumen). |
-| **Bars** | `GET /v3/trading/bars` tidak butuh key (harga feed bid) → bisa dipakai untuk download data historis & training tanpa kredensial. |
+| **API PrimeXBT** | Trading API **v3** di `https://api.primexbt.com/v3/trading` — REST dengan tanda tangan **Ed25519**. Dokumentasi: <https://api.primexbt.com/docs/trading.html> |
+| **API key `pxk_...`** | `pxk_...` adalah **key ID** (publik). Yang menandatangani request adalah **secret Ed25519 (PKCS#8, base64)** yang hanya tampil sekali saat key dibuat. |
+| **Tanpa WebSocket publik** | API v3 belum menyediakan stream WebSocket. `live/engine.py` melakukan *bar-aligned polling* (`settle_ms` setelah penutupan candle) plus pemantauan `quotes` / `positions` / `orders/active`. |
+| **Tanpa endpoint L2 mentah** | API v3 tidak memiliki `/orderbook`, tetapi memiliki `POST /v3/trading/orders/market/impact`. Modul `exchange/orderbook.py` (`pxs orderbook`) membalikkan tangga VWAP multi-ukuran (`[0.01, 0.1, 1, 10, 50]`) menjadi **Synthetic L2 Order Book** (kedalaman marginal, kemiringan buku, & *L2 imbalance*) dan merekamnya lewat `QuoteBookRecorder`. |
+| **Order tidak idempoten** | Dokumentasi PrimeXBT: *"No request is safe to repeat. A placed order sent twice is two orders."* Tidak ada retry buta; `execution/router.py` memakai `clientOrderId` unik dan `live/reconcile.py` memverifikasi status di bursa sebelum bertindak. |
+| **Mode posisi** | Mendukung `NETTING` dan `HEDGE`. Default konfigurasi Hybrid memakai `allow_hedging: false` (satu arah bersih per simbol). |
+| **Data bar publik** | `GET /v3/trading/bars` tidak membutuhkan API key → pengunduhan data historis (`pxs data`) dan pelatihan ulang model dapat dijalankan tanpa kredensial. |
 
 ---
 
-## 2. Arsitektur
+## 2. Arsitektur Hybrid (`Intraday Bias + Scalper Execution`)
 
+### Alur Keputusan Berlapis & Anti-Look-Ahead
+
+```text
+[Data Bar LTF (1M/5M) + Konteks XAG/USD]     [Data Bar HTF (5M/15M) Tertutup Penuh]
+                  │                                            │
+                  └──────────────┬─────────────────────────────┘
+                                 ▼
+        1. Penyelarasan Kausal Multi-Timeframe (features/mtf.py)
+           Syarat ketat: T_htf + Δ_htf ≤ t_ltf + Δ_ltf  (0% kebocoran masa depan)
+                                 │
+                                 ▼
+        2. LAYER 1 — IntradayBiasEngine (strategy/intraday_bias.py)
+           • 15M / 5M Cross-Metal Fair-Value Dislocation (XAU/USD vs XAG/USD)
+           • Anchored Session VWAP (00:00 UTC) + 2H Kaufman Efficiency Ratio
+           • Volatility Regime Ratio (ATR pendek vs baseline sesi) & Rollover Gate
+           Output: BiasSnapshot (BULLISH / BEARISH / NEUTRAL + skor & rezim)
+                                 │
+                                 ▼
+        3. LAYER 2 — HybridStrategy + ONNX Skip-TCN (strategy/hybrid.py)
+           • Inferensi ONNX Antisymmetric MTF Skip-TCN (~103–111 µs p50)
+           • Gerbang statis ONNX: roll_gate, agree_ltf/htf, vol_gate, trend_guard
+           • Konfirmasi mikro 1M: Candle Wick-Absorption (close_location)
+           • Veto otomatis bila sinyal scalper berlawanan dengan Intraday Bias
+                                 │
+                                 ▼
+        4. RiskEngine & ExecutionRouter (risk/engine.py → execution/router.py)
+           • Blackout NFP/CPI/FOMC, batas spread/ATR, loss brakes 4-lapis, sizing
+           • Cek VWAP market impact → kirim order → verifikasi fill → tulis jurnal
 ```
-exchange/    PrimeXBT v3: Ed25519 signing, REST client, typed models
-data/        download + cache Parquet, generator data sintetis (regime-switching)
-features/    fitur stasioner + order-flow + microstructure, labelling anti-leakage
-models/      TCN (causal dilated conv), LSTM/GRU, PatchTST-lite, trainer (EMA, embargo)
-rl/          environment scalping sadar-biaya, PPO & SAC (PyTorch murni)
-inference/   ekspor TorchScript + ONNX Runtime, hot path tanpa alokasi
-strategy/    meta-labelling: arah (supervised) × aksi/size (DRL)
-risk/        sizing berbasis risiko, limit harian, drawdown, kill switch
-execution/   impact → place → verify → reconcile (idempoten via clientOrderId)
-backtest/    event-driven, friksi identik dengan live
-live/        loop, rekonsiliasi, metrik Prometheus
-```
 
-**Kenapa berlapis?** Supaya setiap order bisa diaudit: `arah → veto DRL → ukuran → verdict risiko → eksekusi`. Setiap keputusan ditulis ke `logs/decisions.jsonl` beserta alasannya.
+Setiap siklus bar yang dievaluasi (baik dieksekusi maupun di-*veto* oleh Bias atau Risk Engine) dicatat secara transparan ke `logs/decisions.jsonl`.
 
-### Model prediksi harga (Deep Learning & Time-Series)
+### Kontrak Kausalitas Multi-Timeframe (Zero Look-Ahead)
 
-| Arsitek | Peran | Catatan |
+Kesalahan paling umum pada bot *multi-timeframe* adalah membaca candle `15M` bertanda waktu `10:00` pada eksekusi candle `5M` pukul `10:00` (padahal candle `15M` tersebut baru selesai pukul `10:15`). Di `pxscalper`:
+- `features/mtf.py::align_htf_to_ltf_causal` memaksakan ketaksamaan waktu penutupan bar:
+  $$T_{\text{htf}} + \Delta_{\text{htf}} \le t_{\text{ltf}} + \Delta_{\text{ltf}}$$
+- `live/engine.py::_closed_htf_slice` memotong bar HTF yang masih berjalan sebelum diteruskan ke pipeline fitur maupun `IntradayBiasEngine`, sehingga perilaku *backtest* dan *live* identik 100% (diuji secara adversarial di `tests/test_hybrid_architecture.py`).
+
+### Model Sekuens & Agen Keputusan
+
+| Arsitektur | Peran di Stack | Catatan Teknis |
 |---|---|---|
-| **TCN** | prediksi arah (supervised) | causal dilated conv, receptive field `1 + 2(k−1)(2ⁿ−1)`; ~250 µs p50 di ONNX Runtime |
-| **LSTM / GRU** | alternatif long-memory | satu layer `hidden=64`, cocok bila rezim bertahan lama |
-| **PatchTST-lite** | Transformer kecil | patching 8 bar → attention hanya 8 token, bukan 64 |
-| **PPO / SAC** | agen keputusan (DRL) | meta-labelling: *apakah* bertindak & *seberapa besar* |
+| **Antisymmetric MTF Skip-TCN** | **Model utama Hybrid (`HYBRID_5M` & `HYBRID_1M`)** | *Causal dilated conv* + *skip connection* faktor dislokasi + kepala antisimetris `f(x) = -f(-x)` (bebas bias arah statis) + gerbang MTF/volatilitas/tren/wick yang tertanam langsung di graf ONNX |
+| **TCN standar** | Model sekuens satu-timeframe | Receptive field `1 + 2(k−1)(2ⁿ−1)` dengan *causal chomp* |
+| **LSTM / GRU** | Alternatif memori panjang | 1-layer `hidden=64` untuk eksperimen rezim persisten |
+| **PatchTST-lite** | Transformer ringan | *Causal patching* 8 bar → *self-attention* hanya pada 8 token |
+| **PPO / SAC** | Meta-labelling opsional (DRL) | Memutuskan *apakah* mengeksekusi & faktor pengali ukuran posisi di atas sinyal supervised |
 
-Semua model memakai kontrak yang sama: `x: (B, C, L) float32 → logits (B, n_outputs)`, sepenuhnya **kausal** (diuji oleh `tests/test_models.py::test_causality`).
+### Pipeline Fitur Stasioner & Multi-Timeframe (Bukan OHLC Mentah)
 
-### Fitur input (bukan OHLC mentah)
+Pipeline fitur (`features/pipeline.py` + `microstructure.py` + `calendar.py` + `context.py` + `mtf.py`) mengekstrak **83 fitur kausal pada `HYBRID_5M`** dan **74 fitur kausal pada `HYBRID_1M`** (di atas 38 fitur dasar satu-simbol):
 
-`features/pipeline.py` menghasilkan 38 fitur stasioner & scale-free:
+- **Layer 1 — Fitur Intraday Bias & Konteks Lintas-Aset (`mtf.py`, `context.py`)**:
+  - Dislokasi *rolling-beta fair-value* `XAU/USD` terhadap `XAG/USD` pada timeframe eksekusi (`ctx_xag_rv_z_*`) dan timeframe tinggi (`htf_15m_xag_rv_z_*`, `htf_5m_xag_rv_z_*`).
+  - *Anchored Intraday Session VWAP* (`session_vwap_dev_atr`, `session_vwap_z`, `session_trend_score`).
+  - Rezim volatilitas & efisiensi tren (`vol_regime_ratio`, `efficiency_ratio_2h`, kemiringan EMA HTF, RSI/ATR HTF).
+- **Layer 2 — Fitur Eksekusi Scalper & Mikrostruktur (`pipeline.py`, `microstructure.py`)**:
+  - *Normalized log-returns* multi-horizon, ATR(14)/price, *Garman–Klass*, *Parkinson*, *Bollinger bandwidth*.
+  - Geometri candle & *wick absorption* (`close_location`, `wick_imbalance`, rasio body/range).
+  - *Order-flow & likuiditas kausal*: OFI bar-level, *Bulk Volume Classification* (BVC), spread efektif **Abdi–Ranaldo** & **Corwin–Schultz** (mengisi ketiadaan bid/ask historis secara kausal), *Kyle's lambda*, *Roll measure*, serta *quote/L2 imbalance* saat data live tersedia.
+- **Kalender Makro & Sesi (`calendar.py`)**:
+  - Enkode siklik `sin/cos` jam & menit, penanda sesi Asia/London/NY + overlap, jendela *daily rollover* `21:00–23:00 UTC`, serta jarak waktu ke rilis `NFP`, `CPI`, dan `FOMC`.
 
-- **Normalized returns** pada window 1, 3, 5, 13 bar
-- **Volatilitas**: ATR(14)/price, **Garman-Klass**, Parkinson, realized vol, Bollinger bandwidth
-- **Order flow / imbalance**: bar-level OFI (tick-rule proxy), signed-volume z-score, slope OBV, **Kyle's lambda**
-- **Microstructure**: spread bps, quote imbalance (bid/ask size), deviasi microprice, Roll measure
-- **Momentum**: EMA spread, MACD histogram, RSI(7), Stochastic %K
-- **Session/seasonality**: sin/cos jam & menit, weekday, flag sesi Asia/London/NY + overlap
-- **Regime**: skew, kurtosis, autokorelasi lag-1
+Seluruh normalisasi memakai **causal rolling robust z-score** (median/MAD dengan *warmup* ketat) — tanpa *mean/std* global yang menyebabkan *look-ahead bias*.
 
-Normalisasi memakai **causal rolling robust z-score** (median/MAD), bukan mean/std global — ini menghilangkan *look-ahead* yang paling sering lolos di notebook.
+### Benchmark Latensi Inferensi Aktual
 
-### Optimasi latensi (TorchScript / ONNX)
+Diukur langsung pada artefak produksi yang disertakan di repo (`artifacts/xau_hybrid_5M/tcn.manifest.json` & `artifacts/xau_hybrid_1M/tcn.manifest.json`, CPU 2 thread, batch 1):
 
-Diukur di container 2 vCPU, `TCN(38×64)`, batch 1, 2000 iterasi:
+| Model & Dimensi Input | PyTorch Eager (p50 / p99) | TorchScript (p50 / p99) | ONNX Runtime (p50 / p99) | Speedup p99 |
+|---|---|---|---|---|
+| **Hybrid 5M Skip-TCN (`83 × 64`)** | `710 µs` / `830 µs` | `394 µs` / `564 µs` | **`111 µs` / `264 µs`** | **3.14×** |
+| **Hybrid 1M Skip-TCN (`74 × 64`)** | `729 µs` / `829 µs` | `415 µs` / `515 µs` | **`103 µs` / `157 µs`** | **5.27×** |
 
-| Backend | p50 | p99 |
-|---|---|---|
-| eager PyTorch | 1123 µs | 1242 µs |
-| TorchScript | 891 µs | 986 µs |
-| **ONNX Runtime** | **250 µs** | **330 µs** (~3.8× p99) |
-
-Angka absolut sangat bergantung mesin — **selalu** jalankan `python scripts/export_models.py --all` di box yang akan trading. Selain backend, `inference/predictor.py` memakai buffer input pre-alokasi, `io_binding`, dan ambang `confidence`/`edge` (di bawah ambang → FLAT) sehingga tidak ada keputusan "maksa" saat model ragu.
+`inference/predictor.py` memakai buffer `float32` pre-alokasi, validasi simbol manifes otomatis (`expected_symbol`), kalibrasi suhu (*temperature scaling*), serta ambang `confidence_threshold` dan `edge_threshold` agar model otomatis `FLAT` ketika sinyal lemah.
 
 ---
 
-## 3. Instalasi
+## 3. Instalasi & Verifikasi Lingkungan
 
 ```bash
 git clone https://github.com/datukbubun-web/bot_scalper.git
 cd bot_scalper
 
-python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e ".[train,test]"                        # torch, onnxruntime, dll.
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[train,test]"                        # PyTorch, ONNX Runtime, scikit-learn, pytest
 
-cp .env.example .env      # lalu isi PX_API_KEY + PX_API_SECRET
-make test                 # 68 test, tanpa network
-make smoke                # pipeline end-to-end dengan data sintetis
+cp .env.example .env      # isi PX_API_KEY + PX_API_SECRET bila ingin konek ke PrimeXBT
+pytest -q                 # 246 test (unit, kausalitas MTF, risk, orderbook, live/backtest) — tanpa network
+pxs smoke                 # uji mandiri end-to-end offline dengan data sintetis
 ```
 
-### Kredensial
+### Setup Kredensial PrimeXBT
 
-1. PrimeXBT → **API keys** (2FA wajib aktif) → buat key: satu `read`, satu `trade`.
-2. Salin **key id** (`pxk_...`) dan **secret Ed25519** (base64 PKCS#8, tampil sekali).
-3. Isi `.env`:
+1. Masuk ke PrimeXBT → **API keys** (2FA wajib aktif) → buat key `read` dan (bila siap live) key `trade`.
+2. Salin **Key ID** (`pxk_...`) dan **Ed25519 Secret** (base64 PKCS#8, hanya ditampilkan sekali).
+3. Isi file `.env`:
 
 ```ini
 PX_API_KEY=pxk_...
-PX_API_SECRET=MC4CAQAwBQYDK2Vw...      # <- BUKAN nilai pxk_...
-PX_API_KEY_READ=pxk_...                 # opsional, key read-only
-PX_SYMBOLS=EUR/USD,GBP/USD
+PX_API_SECRET=MC4CAQAwBQYDK2Vw...      # <- secret base64 PKCS#8, BUKAN nilai pxk_...
+PX_API_KEY_READ=pxk_...                 # opsional, untuk perintah inspeksi read-only
+PX_SYMBOLS=XAU/USD
 PX_LIVE_TRADING=0
 ```
 
-4. Verifikasi:
+4. Verifikasi koneksi, *clock skew*, tipe akun (`DEMO` vs `LIVE`), dan kelayakan ukuran simbol:
 
 ```bash
 pxs doctor
+pxs catalogue --equity 100 --leverage 10
 ```
-
-`doctor` memeriksa versi paket, format secret, **clock skew** (signature hanya valid 5 detik), izin key, akun (LIVE/DEMO), dan metadata simbol (`minQty`, `qtyStep`, `takerFeePct`, jam trading).
 
 ---
 
-## 4. Alur kerja
+## 4. Alur Kerja Operasional
+
+### A. Alur Kerja Produksi — Arsitektur Hybrid `XAU/USD` (Direkomendasikan)
 
 ```bash
-# 1) data historis (tanpa API key — endpoint bars publik)
-pxs data --bars 1M --limit 50000
+# 1) Perbarui cache bar historis publik (tanpa API key)
+pxs data --symbols "XAU/USD,XAG/USD" --bars 1M --limit 50000 --update
+pxs data --symbols "XAU/USD,XAG/USD" --bars 5M --limit 25000 --update
+pxs data --symbols "XAU/USD" --bars 15M --limit 20000 --update
 
-# 2) latih model supervised (TCN / lstm / transformer) + ekspor ONNX
-python scripts/training/train_sl.py --arch tcn --symbol EUR/USD --n-bars 60000 --epochs 40 --export
+# 2) Latih ulang, kalibrasi, ekspor ONNX/TorchScript & verifikasi OOS seluruh model XAU/USD
+python3 scripts/training/train_xau.py --bars ALL
 
-# 3) kalibrasi probabilitas (temperature scaling) di slice yang belum pernah dilihat
-python scripts/calibrate.py --arch tcn
+# 3) Periksa status Intraday Bias (Layer 1) & gerbang LONG/SHORT Scalper (Layer 2) saat ini
+pxs bias --symbol XAU/USD --bars 5M --htf 15M
+pxs bias --symbol XAU/USD --bars 1M --htf 15M
 
-# 4) (opsional) latih agen DRL untuk meta-labelling
-python scripts/training/train_rl.py --algo ppo --symbol EUR/USD --steps 200000
+# 4) (Opsional, butuh API key) Rekonstruksi kedalaman Synthetic L2 Order Book live
+pxs orderbook --symbol XAU/USD --ladder "0.01,0.1,1,10,50"
 
-# 5) backtest dengan friksi setara live
-pxs backtest --config configs/live.example.yaml
+# 5) Periksa parameter guard rail risiko sebelum jalan
+pxs risk show --config configs/live.hybrid.yaml
+pxs risk show --config configs/live.mini100.hybrid.yaml
 
-# 6) paper trading (harga live, tanpa uang)
-pxs trade --config configs/live.example.yaml
+# 6) Jalankan walk-forward backtest pada slice OOS (40% terakhir data)
+pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40
 
-# 7) live — butuh DUA izin eksplisit
-PX_LIVE_TRADING=1 pxs trade --config configs/live.yaml --i-understand-the-risk
+# 7) Jalankan Paper Trading (polling harga & impact live, tanpa mengirim uang sungguhan)
+pxs trade --config configs/live.hybrid.yaml
+# atau untuk akun mini $100:
+pxs trade --config configs/live.mini100.hybrid.yaml
+
+# 8) Live Trading — WAJIB dua kunci pengaman eksplisit sekaligus:
+PX_LIVE_TRADING=1 pxs trade --config configs/live.hybrid.yaml --i-understand-the-risk
 ```
 
-Mode aman: `PX_LIVE_TRADING=1` **tanpa** `--i-understand-the-risk` tetap berjalan sebagai paper. Untuk live, `state/risk_state.json` menyimpan limit harian & cooldown, `state/KILL` menghentikan semuanya (`pxs kill`).
+> **Kunci Pengaman Ganda:** Menjalankan `PX_LIVE_TRADING=1` **tanpa** flag `--i-understand-the-risk` (atau sebaliknya) akan tetap memaksa bot berjalan dalam mode **paper**. Untuk menghentikan bot seketika dan menutup posisi terbuka, jalankan `pxs kill --reason "manual stop"`.
+
+### B. Alur Kerja Riset Simbol Baru & Eksperimen Umum
+
+```bash
+# Uji statistik apakah suatu simbol/timeframe memiliki edge bersih setelah biaya (Bonferroni + bootstrap)
+pxs edge --symbol XAU/USD --bars 5M --horizon 12 --cost-bps 0.65
+
+# Latih arsitektur sekuens generik (tcn | lstm | transformer) dengan gerbang --fail-if-no-edge
+python3 scripts/training/train_sl.py --arch tcn --symbol EUR/USD --bars 5M --epochs 40 --export --fail-if-no-edge
+
+# Kalibrasi probabilitas & latih agen meta-labelling DRL (opsional)
+python3 scripts/calibrate.py --arch tcn
+python3 scripts/training/train_rl.py --algo ppo --symbol EUR/USD --steps 200000
+```
 
 ---
 
-## 5. Risiko & guard rail
+## 5. Manajemen Risiko, Guard Rail & Akun Mini `$100`
 
-`risk/engine.py` mengevaluasi 12 pemeriksaan berurutan sebelum uang bergerak: kill switch → akun diblokir → sesi/jam trading → spread → band volatilitas → keyakinan model → exposure/leverage → korelasi → limit rugi harian → drawdown → cooldown setelah 3 loss beruntun → ukuran minimum exchange.
+Sebelum satu pun order diizinkan menyentuh `execution/router.py`, `risk/engine.py` mengevaluasi gerbang pengaman berurutan yang tidak dapat dilewati oleh model maupun strategi:
 
-Sizing berbasis risiko, bukan notional:
+1. **Kill switch (`state/KILL`)** & status blokir akun.
+2. **Validasi simbol tunggal (`single_symbol` / `allowed_symbols`)** agar model khusus `XAU/USD` tidak pernah salah diterapkan ke instrumen lain.
+3. **Macro Event Blackout (`calendar.py`)**: Menjeda pembukaan posisi baru **15 menit sebelum hingga 15 menit sesudah** rilis berdampak ekstrem (`NFP`, `CPI`, `FOMC`).
+4. **Jam perdagangan & Rollover Harian**: Blokir entry saat pasar tutup atau selama pelebaran spread *daily rollover* (`21:00–23:00 UTC`).
+5. **Filter Mikrostruktur & Volatilitas**: Menolak entry jika `spread_bps > max_spread_bps` atau `atr_bps` berada di luar pita aman `[min_atr_bps, max_atr_bps]`.
+6. **Ambang Keyakinan & Edge**: Memastikan `confidence >= min_confidence` dan `edge >= min_edge`.
+7. **Batas Posisi, Leverage & Korelasi**: Membatasi `max_positions`, `max_positions_per_symbol`, `max_gross_exposure_pct`, `max_leverage`, serta eksposur mata uang berkorelasi.
+8. **4-Lapis Rem Kerugian (*Loss Brakes*) & `min_equity`**:
+   - `max_intraday_loss_pct` (rem jeda intraday),
+   - `max_daily_loss_pct` (batas rugi harian),
+   - `max_total_loss_pct` & `max_drawdown_pct` (kunci pengaman modal permanen),
+   - `min_equity` (lantai ekuitas absolut, mis. `$60` pada akun `$100`),
+   - *Cooldown* otomatis setelah `consecutive_loss_cooldown` kerugian beruntun + batas `max_daily_trades`.
+9. **Staged Basket & Profit Lock (`risk/basket.py`)**: Mendukung pembagian eksposur ke slot bertahap (`split_exposure_across_slots`) dan penutupan keranjang otomatis saat profit menyentuh `close_all_on_profit` (lihat `docs/MINI_ACCOUNT_100.md`).
 
-```
-risk_amount   = equity × risk_per_trade_pct / 100
+### Formula Sizing Berbasis Risiko (Tak Pernah Dibulatkan ke Atas)
+
+```text
+risk_amount   = equity × (risk_per_trade_pct / 100) × bias_size_mult
 stop_distance = sl_atr × ATR
-qty           = risk_amount / (stop_distance × pnl_coefficient)   # JPY: 1/price
+qty           = floor_to_step(risk_amount / (stop_distance × pnl_coefficient), qtyStep)
 ```
 
-`qty` **dibulatkan ke bawah** ke `qtyStep`; bila hasilnya < `minQty` → **BLOCK**, tidak pernah dibulatkan ke atas (itu akan melipatgandakan risiko diam-diam).
+Jika `qty < minQty` bursa, order langsung **DIBLOKIR (`BLOCK`)** — bot **tidak pernah** membulatkan ukuran ke atas karena hal itu akan melipatgandakan persentase risiko secara diam-diam pada akun kecil.
 
-Default: risiko 0.25% per trade, stop 1×ATR, target 2×ATR, maksimum 2 posisi, limit rugi harian 2%, drawdown maksimum 5%.
+Pengaturan risiko dapat diperiksa atau diubah tanpa merusak komentar YAML melalui CLI maupun variabel lingkungan `PX_RISK_*`:
+
+```bash
+pxs risk show --config configs/live.mini100.hybrid.yaml
+pxs risk set max_daily_trades=6 --config configs/live.mini100.hybrid.yaml --dry-run
+```
 
 ---
 
-## 6. Struktur repo
+## 6. Struktur Repositori
 
-```
+```text
 src/pxscalper/
-  cli.py               pxs doctor | data | smoke | backtest | trade | reconcile | kill
-  exchange/            signing.py (Ed25519), rest.py, models.py
-  data/pipeline.py     download/cache + sintetis
-  features/            pipeline.py (38 fitur), labels.py (horizon & triple-barrier)
-  models/              sequence.py (TCN, LSTM/GRU, PatchTST), trainer.py
-  rl/                  env.py, agents.py (PPO, SAC), trainer.py
-  inference/           export.py (TorchScript+ONNX+benchmark), predictor.py
-  strategy/decision.py meta-labelling
-  risk/engine.py       sizing + guard rail + kill switch
-  execution/router.py  impact → place → verify → reconcile
-  backtest/engine.py   event-driven, friksi setara live
-  live/                engine.py, reconcile.py, metrics.py
-scripts/training/      train_sl.py, train_rl.py
-scripts/               export_models.py, calibrate.py
-tests/                 68 test (tanpa network, tanpa API key)
-docs/                  API_NOTES.md, MODEL_CARD.md, RUNBOOK.md
+  cli.py                    CLI `pxs`: version | doctor | data | smoke | backtest |
+                            bias | orderbook | trade | catalogue | edge |
+                            risk (show|set) | reconcile | kill
+  exchange/
+    signing.py              Ed25519 request signing (PrimeXBT v3)
+    rest.py, models.py      REST client sinkron, clock sync, skema bertipe
+    orderbook.py            Synthetic L2 Order Book (/impact VWAP inversion) + QuoteBookRecorder
+    catalogue.py            Inspeksi kelayakan instrumen, spread, & qtyStep per modal akun
+  data/pipeline.py          Unduh/update cache Parquet + generator sintetis regime-switching
+  features/
+    pipeline.py             Ekstraksi fitur stasioner, candle wick/body, Session VWAP & rezim vol
+    mtf.py                  Penyelarasan kausal Multi-Timeframe (T_htf + Δ_htf ≤ t_ltf + Δ_ltf) & resampler
+    context.py              Dislokasi fair-value lintas-aset kausal (XAU/USD vs XAG/USD, dll.)
+    microstructure.py       Spread efektif Abdi–Ranaldo, Corwin–Schultz, & BVC kausal
+    calendar.py             Sesi FX, rollover gate 21–23 UTC, & jadwal blackout NFP/CPI/FOMC
+    labels.py, targets.py   Directed triple-barrier, horizon labels, & walk-forward splits
+  models/
+    sequence.py             Antisymmetric MTF Skip-TCN (gerbang statis ONNX), TCN, LSTM/GRU, PatchTST-lite
+    trainer.py              Purged chronological split, EMA weights, NLL baseline check
+  rl/                       Environment scalping sadar-biaya, PPO & SAC (PyTorch murni)
+  inference/
+    export.py               Ekspor PyTorch → TorchScript + ONNX + benchmark latensi
+    predictor.py            Inferensi pre-allocated buffer, kalibrasi suhu, validasi simbol manifes
+  strategy/
+    intraday_bias.py        Layer 1: IntradayBiasEngine (BiasSnapshot, arah, skor & rezim)
+    hybrid.py               Layer 2: HybridStrategy (penyelarasan Bias × sinyal ONNX × wick gate)
+    decision.py             Strategi dasar ScalpingStrategy & meta-labelling DRL
+  risk/
+    engine.py               Guard rail risiko berlapis, sizing berbasis ATR, & KillSwitch
+    basket.py               Manajemen slot bertahap & target profit keranjang (akun mini)
+  execution/router.py       Cek market impact → kirim order → verifikasi fill → proteksi SL/TP
+  backtest/engine.py        Event-driven backtester dengan dukungan HTF kausal & friksi setara live
+  live/
+    engine.py               Loop bar-aligned live/paper, anti-leakage HTF slice, probe L2 berkala
+    reconcile.py            Rekonsiliasi jurnal lokal vs posisi/order aktif di PrimeXBT
+    metrics.py              Metrik Prometheus terisolasi per instance
+  ops/                      Runner backtest, live, smoke test, & editor konfigurasi YAML aman
+  research/edge_screen.py   Skrining hipotesis pra-registrasi dengan koreksi Bonferroni & bootstrap
+configs/                    Preset produksi Hybrid ($10k 5M, $10k 1M, $100 Mini) & contoh riset
+scripts/training/           train_xau.py (pipeline Hybrid & single-TF XAU/USD), train_sl.py, train_rl.py
+scripts/                    export_models.py, calibrate.py, evaluate_real.py, xau_impact_ladder.py
+tests/                      246 test otomatis (tanpa koneksi jaringan & tanpa API key)
+docs/                       XAUUSD_REPORT.md, MINI_ACCOUNT_100.md, MODEL_CARD.md, RUNBOOK.md, API_NOTES.md
 ```
 
 ---
 
-## 7. Batasan yang jujur
+## 7. Batasan yang Jujur
 
-- **Belum ada L2 order book** di API v3 → fitur order-flow memakai proxy tick-rule dari bar, bukan true imbalance.
-- **Belum ada websocket** → latensi dibatasi polling REST (~ratusan ms). Cocok untuk scalping 1-menit, **bukan** HFT sub-detik.
-- **Model tidak dijamin profitable.** Konfigurasi default sengaja konservatif; backtest pada data sintetis hanya menguji *plumbing*, bukan edge.
-- **Biaya adalah musuh utama scalping.** Taker fee 0.05%/sisi + spread berarti butuh pergerakan > ~0.1% untuk break-even; uji apakah `min_edge` Anda realistis.
-- **Demo dulu.** `pxs doctor` menunjukkan apakah akun Anda `DEMO` atau `LIVE`.
+- **Synthetic L2 vs Native Push Order Book**: Karena API v3 belum menyediakan stream L2 *tick-by-tick*, `exchange/orderbook.py` merekonstruksi kedalaman buku secara berkala dari tangga VWAP `/orders/market/impact` saat *live/paper*, sementara data historis memakai estimator kausal Abdi–Ranaldo, Corwin–Schultz, dan BVC. Ini sangat efektif untuk mendeteksi likuiditas tipis dan *slippage*, namun **bukan** pengganti *queue-position HFT*.
+- **Latensi Polling REST**: Tanpa WebSocket, ritme eksekusi mengikuti penutupan candle `1M` / `5M` (+ `settle_ms` ~`0.9–1.2` detik). Arsitektur Hybrid memang dirancang untuk menangkap dislokasi `1M–15M` dengan target masa tahan beberapa bar (15–60 menit), **bukan** arbitrase sub-detik.
+- **Struktur Biaya Sangat Menentukan**: Pada CFD logam `XAU/USD` di PrimeXBT (`0%` taker fee, spread tipikal `~0.49–0.65 bps`), edge dislokasi lintas-logam `XAU/XAG` mampu melampaui friksi bahkan pada *stress test* 2× biaya (`1.30 bps`). Sebaliknya, pada instrumen dengan komisi taker `0.05%/sisi` + spread lebar, sinyal mikro yang sama bisa habis dimakan biaya — selalu periksa dengan `pxs edge` dan `pxs catalogue`.
+- **Rezim Pasar Berubah (*Non-Stationarity*)**: Korelasi struktural `XAU/USD` vs `XAG/USD` dan karakter volatilitas sesi dapat bergeser seiring waktu. Pantau metrik harian di `logs/decisions.jsonl`, latih ulang secara berkala (`train_xau.py --bars ALL`), dan jangan pernah mematikan batas risiko di `risk/engine.py`.
 
 ## 8. Lisensi
 
-MIT — lihat `LICENSE`. Penggunaan sepenuhnya tanggung jawab Anda.
+MIT — lihat `LICENSE`. Seluruh risiko penggunaan ditanggung sepenuhnya oleh pengguna.
