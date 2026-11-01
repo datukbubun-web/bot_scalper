@@ -31,6 +31,9 @@ Beberapa file biner model & cache historis **sengaja** disertakan di repositori 
 | `configs/live.hybrid.yaml` | Standar `$10.000` (`15M Bias -> 5M Exec`, risiko `0.5%/trade`) | `n=77` \| Akhir `$10.527,11` (**+5.27%**) \| **Sharpe +4.35** \| **Calmar 28.81** \| **PF 2.01** \| **WR 64.94%** \| **MaxDD 0.72%** \| `+6.70 bps/trade` |
 | `configs/live.hybrid.1m.yaml` | Presisi Mikro `$10.000` (`5M/15M Bias -> 1M Wick Exec`, risiko `0.5%/trade`) | `n=84` \| Akhir `$10.427,44` (**+4.27%**) \| **Sharpe +3.62** \| **Calmar 19.73** \| **PF 1.68** \| **WR 64.29%** \| **MaxDD 0.83%** \| `+5.01 bps/trade` |
 | `configs/live.mini100.hybrid.yaml` | Akun Mini `$100` (`0.01 oz` XAU/USD, `15M Bias -> 5M Exec` + *safety guardrails*) | `n=77` \| Akhir `$103,89` (**+3.89%**) \| **Sharpe +3.91** \| **Calmar 23.60** \| **PF 1.89** \| **WR 64.94%** \| **MaxDD 0.64%** \| `+4.98 bps/trade` |
+| `configs/live.hybrid.compound.yaml` | **High-Growth Compounding** `$10.000` (`daily` compound + *DD-Scale*, target `~3%/hari bursa`) | `n=77` \| Akhir `$23.418,87` (**+134.19%**, **`+3.14%/hari bursa`**) \| **Sharpe +4.18** \| **PF 1.76** \| **WR 64.94%** \| **MaxDD 13.66%** |
+| `configs/live.mini100.compound.yaml` | **Akun Mini `$100` Compounding** (`0.01 oz` XAU/USD, `daily` compound + *DD-Scale*) | `n=77` \| Akhir `$232,09` (**+132.09%**, **`+3.11%/hari bursa`**) \| **Sharpe +4.16** \| **PF 1.76** \| **WR 64.94%** \| **MaxDD 13.58%** |
+| `configs/live.hybrid.daily3pct_lock.yaml` | **Balanced Compound + Kunci Profit Harian `+3.0%`** (`$1.000`, *auto-harvest* & *pause* UTC) | `n=62` \| Akhir `$1.275,71` (**+27.57%**, kunci `+3%/hari`) \| **Sharpe +3.70** \| **PF 1.82** \| **WR 67.74%** \| **MaxDD 4.27%** |
 
 Reproduksi penuh training, inspeksi *Intraday Bias*, & verifikasi OOS Hybrid XAU/USD:
 
@@ -41,6 +44,9 @@ pxs bias --symbol XAU/USD --bars 1M --htf 15M
 pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40
 pxs backtest --config configs/live.hybrid.1m.yaml --oos-frac 0.40
 pxs backtest --config configs/live.mini100.hybrid.yaml --oos-frac 0.40
+pxs compound --config configs/live.hybrid.compound.yaml --days 30
+pxs compound --config configs/live.mini100.compound.yaml --days 30
+pxs compound --config configs/live.hybrid.daily3pct_lock.yaml --days 30
 ```
 
 `logs/` dan `state/` tetap diabaikan oleh `.gitignore` agar riwayat posisi, *risk state*, dan data akun tidak pernah bocor ke Git.
@@ -152,7 +158,7 @@ python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\ac
 pip install -e ".[train,test]"                        # PyTorch, ONNX Runtime, scikit-learn, pytest
 
 cp .env.example .env      # isi PX_API_KEY + PX_API_SECRET bila ingin konek ke PrimeXBT
-pytest -q                 # 261 test (unit, kausalitas MTF, paritas train/serve, risk, orderbook, live/backtest) — tanpa network
+pytest -q                 # 270 test (unit, kausalitas MTF, paritas train/serve, compounding, risk, orderbook, live/backtest) — tanpa network
 pxs smoke                 # uji mandiri end-to-end offline dengan data sintetis
 ```
 
@@ -276,8 +282,8 @@ pxs risk set max_daily_trades=6 --config configs/live.mini100.hybrid.yaml --dry-
 ```text
 src/pxscalper/
   cli.py                    CLI `pxs`: version | doctor | data | smoke | backtest |
-                            bias | orderbook | trade | catalogue | edge |
-                            risk (show|set) | reconcile | kill
+                            compound | bias | orderbook | trade | catalogue |
+                            edge | risk (show|set) | reconcile | kill
   exchange/
     signing.py              Ed25519 request signing (PrimeXBT v3)
     rest.py, models.py      REST client sinkron, clock sync, skema bertipe
@@ -313,10 +319,10 @@ src/pxscalper/
     metrics.py              Metrik Prometheus terisolasi per instance
   ops/                      Runner backtest, live, smoke test, & editor konfigurasi YAML aman
   research/edge_screen.py   Skrining hipotesis pra-registrasi dengan koreksi Bonferroni & bootstrap
-configs/                    Preset produksi Hybrid ($10k 5M, $10k 1M, $100 Mini) & contoh riset
+configs/                    Preset produksi Hybrid ($10k 5M/1M, $100 Mini, & Compounding 3%/hari)
 scripts/training/           train_xau.py (pipeline Hybrid & single-TF XAU/USD), train_sl.py, train_rl.py
 scripts/                    export_models.py, calibrate.py, evaluate_real.py, xau_impact_ladder.py
-tests/                      261 test otomatis (tanpa koneksi jaringan & tanpa API key)
+tests/                      270 test otomatis (tanpa koneksi jaringan & tanpa API key)
 docs/                       XAUUSD_REPORT.md, MINI_ACCOUNT_100.md, MODEL_CARD.md, RUNBOOK.md, API_NOTES.md
 ```
 

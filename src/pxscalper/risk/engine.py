@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -106,8 +107,22 @@ class RiskDecision(str, Enum):
 
 @dataclass
 class RiskConfig:
-    # sizing
-    risk_per_trade_pct: float = 0.25      # of equity, to the stop distance
+    # sizing & compounding
+    risk_per_trade_pct: float = 0.25      # of sizing equity, to the stop distance
+    #: Equity base used for compounding lot sizes:
+    #:   "continuous" -- size against live equity on every trade
+    #:   "daily"      -- re-compound once per UTC day off min(day_start_equity, equity)
+    #:   "fixed"      -- flat sizing off initial_equity (no compounding)
+    compound_mode: str = "continuous"
+    #: Daily profit lock (% of day_start_equity). >0 pauses new entries once the
+    #: UTC day's net gain reaches this percentage, resuming at 00:00 UTC rollover
+    #: on the newly compounded day_start_equity. 0 disables.
+    daily_profit_target_pct: float = 0.0
+    #: Anti-Martingale / Fractional-Kelly drawdown throttle: automatically scales
+    #: down risk_per_trade_pct when peak-to-trough drawdown exceeds dd_scale_start_pct.
+    compound_dd_scale: bool = False
+    dd_scale_start_pct: float = 4.0
+    dd_scale_min_factor: float = 0.35
     # ---- instrument scope ---------------------------------------------------
     # One instrument only, by default. A scalper's edge (if any) lives in one
     # market at one cost structure; splitting attention and capital across
@@ -179,6 +194,14 @@ class RiskConfig:
     # Resolved once at import: with `from __future__ import annotations` the
     # dataclass field types are strings, so coercion needs the real classes.
     _field_types: ClassVar[dict[str, Any]] = {}
+
+    def __post_init__(self) -> None:
+        mode = str(self.compound_mode).strip().lower()
+        if mode not in ("continuous", "daily", "fixed"):
+            raise ValueError(
+                f"compound_mode must be 'continuous', 'daily', or 'fixed' (got {self.compound_mode!r})"
+            )
+        self.compound_mode = mode
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], *, allow_env: bool = True) -> "RiskConfig":
@@ -666,18 +689,28 @@ class RiskEngine:
                     f"{cfg.max_intraday_loss_pct}% -> pause until UTC rollover",
                 )
 
-        # 10. daily loss -------------------------------------------------------
+        # 10. daily loss & daily profit target lock ----------------------------
         day_pnl_pct = (
             (equity - self.state.day_start_equity) / self.state.day_start_equity * 100
             if self.state.day_start_equity
             else 0.0
         )
+        details["day_pnl_pct"] = day_pnl_pct
         checks["daily_loss_ok"] = day_pnl_pct > -cfg.max_daily_loss_pct
         if not checks["daily_loss_ok"]:
             self.kill.engage(f"daily loss {day_pnl_pct:.2f}%")
             return verdict(RiskDecision.BLOCK, f"daily loss {day_pnl_pct:.2f}% breached")
 
-        # 10. drawdown ---------------------------------------------------------
+        if cfg.daily_profit_target_pct > 0 and self.state.day_start_equity > 0:
+            checks["daily_profit_target_ok"] = day_pnl_pct < (cfg.daily_profit_target_pct - 1e-9)
+            if not checks["daily_profit_target_ok"]:
+                return verdict(
+                    RiskDecision.FLAT,
+                    f"daily profit target +{day_pnl_pct:.2f}% >= "
+                    f"+{cfg.daily_profit_target_pct:g}% locked -> pause until UTC rollover",
+                )
+
+        # 10b. drawdown --------------------------------------------------------
         dd_pct = (
             (self.state.peak_equity - equity) / self.state.peak_equity * 100
             if self.state.peak_equity
@@ -703,7 +736,25 @@ class RiskEngine:
 
         # ------------------------------------------------------- position sizing
         stop_distance = max(cfg.sl_atr * atr, price * 1e-6)
-        risk_amount = equity * cfg.risk_per_trade_pct / 100.0
+        if cfg.compound_mode == "daily" and self.state.day_start_equity > 0:
+            sizing_equity = min(self.state.day_start_equity, equity)
+        elif cfg.compound_mode == "fixed" and self.state.initial_equity > 0:
+            sizing_equity = min(self.state.initial_equity, equity)
+        else:
+            sizing_equity = equity
+
+        eff_risk_pct = cfg.risk_per_trade_pct
+        if cfg.compound_dd_scale and dd_pct > cfg.dd_scale_start_pct:
+            span = max(cfg.max_drawdown_pct - cfg.dd_scale_start_pct, 1.0)
+            dd_factor = max(
+                cfg.dd_scale_min_factor,
+                1.0 - (dd_pct - cfg.dd_scale_start_pct) / span * (1.0 - cfg.dd_scale_min_factor),
+            )
+            eff_risk_pct = cfg.risk_per_trade_pct * dd_factor
+            details["dd_scale_factor"] = dd_factor
+        details["sizing_equity"] = sizing_equity
+        details["effective_risk_pct"] = eff_risk_pct
+        risk_amount = sizing_equity * eff_risk_pct / 100.0
         try:
             coeff = pnl_coefficient(symbol, price, quote_usd_rate)
         except ValueError as exc:
@@ -730,7 +781,7 @@ class RiskEngine:
 
         # respect exchange increments: floor, never round up into more risk
         if qty_step > 0:
-            steps = int(raw_qty // qty_step)
+            steps = int(math.floor((raw_qty + 1e-12) / qty_step))
             qty = steps * qty_step
         else:
             qty = raw_qty

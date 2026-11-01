@@ -299,6 +299,35 @@ def run_backtest_from_config(
             min_edge=float(bt_raw.get("min_edge", strat_raw.get("min_edge", inf_raw.get("edge_threshold", 0.03)))),
             max_leverage=float(bt_raw.get("max_leverage", risk_raw.get("max_leverage", 5.0))),
             max_gross_exposure_pct=float(bt_raw.get("max_gross_exposure_pct", risk_raw.get("max_gross_exposure_pct", 300.0))),
+            compound=bool(bt_raw.get("compound", True)),
+            compound_mode=str(bt_raw.get("compound_mode", risk_raw.get("compound_mode", "continuous"))),
+            daily_profit_target_pct=float(
+                bt_raw.get("daily_profit_target_pct", risk_raw.get("daily_profit_target_pct", 0.0))
+            ),
+            harvest_daily_profit_target=bool(
+                bt_raw.get(
+                    "harvest_daily_profit_target",
+                    live_cfg.get(
+                        "harvest_daily_profit_target",
+                        raw.get("harvest_daily_profit_target", False),
+                    ),
+                )
+            ),
+            max_daily_loss_pct=float(
+                bt_raw.get("max_daily_loss_pct", 0.0)
+            ),
+            compound_dd_scale=bool(
+                bt_raw.get("compound_dd_scale", risk_raw.get("compound_dd_scale", False))
+            ),
+            dd_scale_start_pct=float(
+                bt_raw.get("dd_scale_start_pct", risk_raw.get("dd_scale_start_pct", 4.0))
+            ),
+            dd_scale_min_factor=float(
+                bt_raw.get("dd_scale_min_factor", risk_raw.get("dd_scale_min_factor", 0.35))
+            ),
+            max_drawdown_pct=float(
+                bt_raw.get("max_drawdown_pct", risk_raw.get("max_drawdown_pct", 25.0))
+            ),
             min_qty=float(bt_raw.get("min_qty", default_step)),
             qty_step=float(bt_raw.get("qty_step", default_step)),
             pnl_coefficient=coeff,

@@ -99,10 +99,4 @@ backtest:
   taker_fee_pct: 0.0
   slippage_coef: 0.0
   spread_bps_fallback: 0.65
-  risk_per_trade_pct: 0.5
-  sl_atr: 10.0
-  tp_atr: 13.5
-  max_holding_bars: 60
-  min_confidence: 0.45
-  min_edge: 0.03
   align_to_context_span: true

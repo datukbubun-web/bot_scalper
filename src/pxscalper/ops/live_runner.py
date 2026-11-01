@@ -94,11 +94,20 @@ def build_engine(
         close_all_on_profit=float(
             live_raw.get("close_all_on_profit", raw.get("close_all_on_profit", 0.0))
         ),
+        close_all_on_profit_pct=float(
+            live_raw.get("close_all_on_profit_pct", raw.get("close_all_on_profit_pct", 0.0))
+        ),
         close_all_enforce=bool(
             live_raw.get("close_all_enforce", raw.get("close_all_enforce", False))
         ),
         close_all_cooldown_s=float(
             live_raw.get("close_all_cooldown_s", raw.get("close_all_cooldown_s", 300.0))
+        ),
+        harvest_daily_profit_target=bool(
+            live_raw.get(
+                "harvest_daily_profit_target",
+                raw.get("harvest_daily_profit_target", False),
+            )
         ),
         l2_probe_interval_s=float(
             live_raw.get("l2_probe_interval_s", raw.get("l2_probe_interval_s", 60.0))

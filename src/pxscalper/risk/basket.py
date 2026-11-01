@@ -82,11 +82,13 @@ class BasketTarget:
         self,
         target: float = 0.0,
         *,
+        target_pct: float = 0.0,
         arm_above: float = 0.0,
         cooldown_s: float = 0.0,
         clock=time.time,
     ) -> None:
         self.target = float(target)
+        self.target_pct = float(target_pct)
         self.arm_above = float(arm_above)
         # After firing, the account is flat. Re-arming immediately would close the
         # first position of the next cycle the moment it shows a cent of profit,
@@ -96,19 +98,30 @@ class BasketTarget:
         self._last_fire_s: float = 0.0
         self.fires: int = 0
 
+    def effective_target(self, equity: float = 0.0) -> float:
+        """Compounding basket target in account currency."""
+        pct_target = (float(equity) * self.target_pct / 100.0) if (self.target_pct > 0 and equity > 0) else 0.0
+        if self.target > 0 and pct_target > 0:
+            return max(self.target, pct_target)
+        if pct_target > 0:
+            return pct_target
+        return self.target
+
     # ------------------------------------------------------------------ arming
-    def armed(self) -> bool:
-        if self.target <= 0:
+    def armed(self, equity: float = 0.0) -> bool:
+        if self.effective_target(equity) <= 0:
             return False
         return (self._clock() - self._last_fire_s) >= self.cooldown_s
 
-    def seconds_to_arm(self) -> float:
-        if self.target <= 0:
+    def seconds_to_arm(self, equity: float = 0.0) -> float:
+        if self.effective_target(equity) <= 0:
             return 0.0
         return max(0.0, self.cooldown_s - (self._clock() - self._last_fire_s))
 
     # ---------------------------------------------------------------- decision
-    def evaluate(self, positions: Iterable[Any], *, enforce: bool = False) -> BasketResult:
+    def evaluate(
+        self, positions: Iterable[Any], *, enforce: bool = False, equity: float = 0.0
+    ) -> BasketResult:
         """Should the whole basket be closed right now?
 
         ``enforce`` is the operator's explicit "yes, close even though a position
@@ -119,37 +132,38 @@ class BasketTarget:
         total = basket_pnl(positions)
         winners = sum(1 for p in positions if position_pnl(p) > 0)
         losers = sum(1 for p in positions if position_pnl(p) < 0)
+        eff_target = self.effective_target(equity)
 
-        if self.target <= 0:
+        if eff_target <= 0:
             return BasketResult(False, total, len(positions), winners, losers,
-                                self.target, "basket target disabled")
+                                eff_target, "basket target disabled")
         if not positions:
-            return BasketResult(False, total, 0, winners, losers, self.target,
+            return BasketResult(False, total, 0, winners, losers, eff_target,
                                 "no open positions")
-        if not self.armed():
+        if not self.armed(equity):
             return BasketResult(
-                False, total, len(positions), winners, losers, self.target,
-                f"re-arming in {self.seconds_to_arm():.0f}s",
+                False, total, len(positions), winners, losers, eff_target,
+                f"re-arming in {self.seconds_to_arm(equity):.0f}s",
             )
-        if total < self.target:
+        if total < eff_target:
             return BasketResult(
-                False, total, len(positions), winners, losers, self.target,
-                f"${total:+.2f} of ${self.target:.2f}",
+                False, total, len(positions), winners, losers, eff_target,
+                f"${total:+.2f} of ${eff_target:.2f}",
             )
         if total < self.arm_above:
             return BasketResult(
-                False, total, len(positions), winners, losers, self.target,
+                False, total, len(positions), winners, losers, eff_target,
                 f"below arm threshold ${self.arm_above:.2f}",
             )
         if not enforce:
             return BasketResult(
-                True, total, len(positions), winners, losers, self.target,
-                f"${total:+.2f} reached ${self.target:.2f} (report only; "
+                True, total, len(positions), winners, losers, eff_target,
+                f"${total:+.2f} reached ${eff_target:.2f} (report only; "
                 f"set close_all_on_profit to act)",
             )
         return BasketResult(
-            True, total, len(positions), winners, losers, self.target,
-            f"TARGET HIT ${total:+.2f} >= ${self.target:.2f} -> closing all "
+            True, total, len(positions), winners, losers, eff_target,
+            f"TARGET HIT ${total:+.2f} >= ${eff_target:.2f} -> closing all "
             f"{len(positions)} position(s) ({winners} up, {losers} down)",
         )
 

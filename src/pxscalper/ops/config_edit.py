@@ -44,8 +44,10 @@ def read_effective(path: str | Path, *, allow_env: bool = True) -> RiskConfig:
 # as often. Kept separate so `pxs risk set` can reach them.
 TOP_LEVEL_DEFAULTS: dict[str, Any] = {
     "close_all_on_profit": 0.0,
+    "close_all_on_profit_pct": 0.0,
     "close_all_enforce": False,
     "close_all_cooldown_s": 300.0,
+    "harvest_daily_profit_target": False,
 }
 
 
@@ -258,7 +260,22 @@ def describe(cfg: RiskConfig, stops_at_pct: float | None = None) -> list[tuple[s
         else "(disabled)",
     )
     guard("max_drawdown_pct", cfg.max_drawdown_pct, "kill switch from the peak")
+    if cfg.daily_profit_target_pct > 0:
+        guard(
+            "daily_profit_target_pct",
+            cfg.daily_profit_target_pct,
+            "lock daily profit until UTC rollover",
+        )
     rows.append(("risk_per_trade_pct", f"{risk:g}%", "size per trade, to the stop"))
+    rows.append(
+        (
+            "compound_mode",
+            cfg.compound_mode,
+            "equity compounding ("
+            + ("dd-scale on" if cfg.compound_dd_scale else "dd-scale off")
+            + ")",
+        )
+    )
     rows.append(("max_leverage", f"{cfg.max_leverage:g}x", "position ceiling"))
     rows.append(("max_daily_trades", str(cfg.max_daily_trades), "trade budget per UTC day"))
     rows.append(
