@@ -117,6 +117,7 @@ class LiveEngine:
         self._last_l2_probe: dict[str, float] = {}
         self._known_positions: dict[int | str, Position] = {}
         self._paper_positions: dict[int | str, Position] = {}
+        self._paper_realised_pnl: float = 0.0
         self._next_paper_id: int = 900_000
         self._last_journal_sig: tuple[Any, ...] | None = None
         self._seen_fill_ids: set[int] = set()
@@ -135,6 +136,15 @@ class LiveEngine:
 
     def _is_dry_run(self) -> bool:
         return bool(getattr(getattr(self.router, "config", None), "dry_run", False))
+
+    def _effective_equity(self, account, positions: list[Position]) -> float:
+        if not self._is_dry_run():
+            return float(account.equity)
+        return float(
+            account.equity
+            + self._paper_realised_pnl
+            + sum((p.upl or 0.0) for p in positions)
+        )
 
     def _managed_positions(self, positions: list[Position]) -> list[Position]:
         allowed = set(self.config.symbols)
@@ -273,23 +283,31 @@ class LiveEngine:
         closed = frame[frame["time"].astype(np.int64) + htf_ms <= ltf_close_ms]
         return closed.reset_index(drop=True) if not closed.empty else None
 
-    def _load_symbol_history(self, symbol: str, target_bar_size: str | None = None, need_bars: int | None = None) -> pd.DataFrame:
+    def _load_symbol_history(
+        self,
+        symbol: str,
+        target_bar_size: str | None = None,
+        need_bars: int | None = None,
+    ) -> pd.DataFrame:
         bs = target_bar_size or self.config.bar_size
+        need = need_bars if need_bars is not None else self.config.warmup_bars
         bars = self.client.bars(symbol, bs, limit=500)
         if not bars:
             return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-        collected = list(reversed(bars))
-        need = need_bars if need_bars is not None else self.config.warmup_bars
-        oldest = collected[0].time
-        while len(collected) < need:
-            chunk = self.client.bars(
-                symbol, bs, limit=500, end_ms=oldest - 1
-            )
+        by_time: dict[int, Any] = {int(b.time): b for b in bars}
+        oldest = min(by_time)
+        while len(by_time) < need:
+            chunk = self.client.bars(symbol, bs, limit=500, end_ms=oldest - 1)
             if not chunk:
                 break
-            collected = chunk + collected
-            oldest = chunk[0].time
-        return _bars_to_frame(collected)
+            chunk_oldest = min(int(b.time) for b in chunk)
+            for b in chunk:
+                by_time[int(b.time)] = b
+            if chunk_oldest >= oldest:
+                break
+            oldest = chunk_oldest
+        ordered = [by_time[t] for t in sorted(by_time)]
+        return _bars_to_frame(ordered)
 
     # ---------------------------------------------------------------- lifecycle
     def prepare(self) -> None:
@@ -364,11 +382,7 @@ class LiveEngine:
                 if self._is_dry_run():
                     positions = list(self._paper_positions.values())
                     managed = positions
-                    eff_equity = (
-                        account.equity
-                        + self.risk.state.realised_pnl_today
-                        + sum(p.upl for p in positions)
-                    )
+                    eff_equity = self._effective_equity(account, positions)
                     self.risk.on_account(eff_equity)
                     self.metrics.set_equity(eff_equity)
                 else:
@@ -616,6 +630,7 @@ class LiveEngine:
         prediction = self.predictor.predict(window)
         self.metrics.set_inference_latency(prediction.latency_us)
 
+        eff_equity = self._effective_equity(account, positions)
         rl_obs = None
         if self.strategy.rl_policy is not None:
             flat = window[0, :, -1]
@@ -623,7 +638,7 @@ class LiveEngine:
             if symbol_positions:
                 p = symbol_positions[0]
                 pos_state[0] = 1.0 if p.side == "BUY" else -1.0
-                pos_state[1] = p.upl / max(account.equity, 1e-9)
+                pos_state[1] = p.upl / max(eff_equity, 1e-9)
             rl_obs = np.concatenate([flat, pos_state]).astype(np.float32)
 
         decision = self.strategy.decide(
@@ -642,7 +657,7 @@ class LiveEngine:
             confidence=decision.confidence,
             edge=decision.edge,
             price=mid,
-            equity=account.equity,
+            equity=eff_equity,
             atr=atr,
             spread_bps=spread_bps,
             market_open=quote.market_open,
@@ -730,11 +745,7 @@ class LiveEngine:
                 # and sizes off actual realized equity.
                 if self._is_dry_run():
                     positions[:] = list(self._paper_positions.values())
-                    post_eq = (
-                        account.equity
-                        + self.risk.state.realised_pnl_today
-                        + sum(p.upl for p in positions)
-                    )
+                    post_eq = self._effective_equity(account, positions)
                 else:
                     try:
                         account = self.client.metrics()
@@ -907,9 +918,11 @@ class LiveEngine:
             )
             return
         self._known_positions.pop(pos.id, None)
-        self._paper_positions.pop(pos.id, None)
+        was_paper = self._paper_positions.pop(pos.id, None) is not None
         self._position_hold_mult.pop(pos.id, None)
         pnl = float(pnl_override if pnl_override is not None else pos.upl)
+        if was_paper or result.dry_run:
+            self._paper_realised_pnl += pnl
         self.risk.on_trade_closed(pnl)
         if pnl < 0:
             self._last_loss_s = self._clock()
@@ -1089,10 +1102,13 @@ class LiveEngine:
 
 
 def _bars_to_frame(bars) -> pd.DataFrame:
-    return pd.DataFrame(
+    if not bars:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(
         [
             {"time": b.time, "open": b.open, "high": b.high, "low": b.low,
              "close": b.close, "volume": b.volume}
             for b in bars
         ]
     )
+    return df.drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)
