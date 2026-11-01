@@ -826,3 +826,111 @@ def test_live_engine_run_skips_same_bar_reentry_after_basket_harvest(tmp_path: P
     assert process_calls == [], "must NOT immediately re-open on the exact same bar right after basket harvest"
     assert eng._last_trade_s == pytest.approx(now_s[0])
 
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_load_symbol_history_handles_both_asc_and_desc_api_bar_order(
+    tmp_path: Path, descending: bool
+) -> None:
+    from pxscalper.exchange.models import Bar
+
+    all_bars = [
+        Bar(time=1_700_000_000_000 + i * 300_000, open=2000.0 + i, high=2001.0 + i, low=1999.0 + i, close=2000.5 + i, volume=10.0)
+        for i in range(1300)
+    ]
+
+    class PagingBarClient:
+        def bars(self, symbol: str, bar_size: str = "5M", limit: int = 500, end_ms: int | None = None):
+            avail = [b for b in all_bars if end_ms is None or b.time <= end_ms]
+            page = avail[-limit:]
+            return list(reversed(page)) if descending else page
+
+    class _Pred:
+        config = type("C", (), {"n_features": 38, "lookback": 64, "backend": "onnx"})()
+
+    risk = RiskEngine(
+        RiskConfig(state_path=str(tmp_path / "r.json"), kill_switch_path=str(tmp_path / "K")),
+        RiskState(),
+    )
+    router = OrderRouter(PagingBarClient(), ExecutionConfig(dry_run=True))  # type: ignore[arg-type]
+    eng = LiveEngine(
+        client=PagingBarClient(),  # type: ignore[arg-type]
+        predictor=_Pred(),  # type: ignore[arg-type]
+        risk=risk,
+        router=router,
+        strategy=ScalpingStrategy(None, StrategyConfig(require_rl_agreement=False)),  # type: ignore[arg-type]
+        config=LiveConfig(
+            symbols=["XAU/USD"],
+            bar_size="5M",
+            warmup_bars=1200,
+            log_path=str(tmp_path / "decisions.jsonl"),
+            state_path=str(tmp_path / "live_positions.json"),
+        ),
+        metrics=Metrics(enable_server=False),
+    )
+    frame = eng._load_symbol_history("XAU/USD", need_bars=1200)
+    assert len(frame) >= 1200
+    assert frame["time"].nunique() == len(frame), "no duplicate bar timestamps"
+    assert frame["time"].is_monotonic_increasing, "bars must be strictly oldest-to-newest"
+    assert int(frame["time"].iloc[-1]) == all_bars[-1].time
+
+
+def test_paper_mode_retains_realised_pnl_across_utc_day_boundary_for_sizing(
+    tmp_path: Path,
+) -> None:
+    day1_s = 1_760_000_000.0
+    now_s = [day1_s]
+    risk = RiskEngine(
+        RiskConfig(
+            state_path=str(tmp_path / "r.json"),
+            kill_switch_path=str(tmp_path / "K"),
+            compound_mode="daily",
+        ),
+        RiskState(),
+        clock=lambda: now_s[0],
+    )
+    class _Pred:
+        config = type("C", (), {"n_features": 38, "lookback": 64, "backend": "onnx"})()
+
+    router = OrderRouter(object(), ExecutionConfig(dry_run=True))  # type: ignore[arg-type]
+    eng = LiveEngine(
+        client=object(),  # type: ignore[arg-type]
+        predictor=_Pred(),  # type: ignore[arg-type]
+        risk=risk,
+        router=router,
+        strategy=ScalpingStrategy(None, StrategyConfig(require_rl_agreement=False)),  # type: ignore[arg-type]
+        config=LiveConfig(
+            symbols=["XAU/USD"],
+            bar_size="5M",
+            paper=True,
+            log_path=str(tmp_path / "decisions.jsonl"),
+            state_path=str(tmp_path / "live_positions.json"),
+        ),
+        metrics=Metrics(enable_server=False),
+        clock=lambda: now_s[0],
+    )
+    acct = AccountMetrics.from_api(
+        {"accountId": "DEMO", "currency": "USD", "balance": 1000.0, "equity": 1000.0}
+    )
+    risk.on_account(eng._effective_equity(acct, []))
+
+    paper_pos = Position(
+        id=900_001, symbol="XAU/USD", side="BUY", qty=1.0,
+        open_price=4000.0, current_price=4050.0, mark_price=4050.0,
+        upl=50.0, roe_pct=5.0, liq_price=None, margin=0.0, client_leverage=20.0,
+        stop_loss_price=None, take_profit_price=None,
+        open_time=int(day1_s * 1000), exposure=4050.0,
+    )
+    eng._paper_positions[paper_pos.id] = paper_pos
+    res = router.close_position(paper_pos, reason="tp")
+    eng._after_close(paper_pos, res, pnl_override=50.0)
+
+    # Advance across 00:00 UTC into Day 2: RiskState.realised_pnl_today resets to 0,
+    # while cumulative paper equity must stay $1050.0 so Day 2 compounds off $1050.0!
+    now_s[0] = day1_s + 86_400.0
+    eff_day2 = eng._effective_equity(acct, [])
+    risk.on_account(eff_day2)
+    assert risk.state.realised_pnl_today == 0.0
+    assert eff_day2 == pytest.approx(1050.0)
+    assert risk.state.day_start_equity == pytest.approx(1050.0)
+
+
