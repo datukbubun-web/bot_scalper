@@ -132,7 +132,7 @@ def test_qty_floored_to_step():
     client = FakeClient()
     router = OrderRouter(client, ExecutionConfig(verify_fills=False), SETTINGS)
     router.open_position("EUR/USD", "LONG", 0.0129, None, None, 1.10)
-    assert client.placed[0]["qty"] == pytest.approx(0.013)
+    assert client.placed[0]["qty"] == pytest.approx(0.012)
 
 
 def test_dry_run_sends_nothing():

@@ -89,6 +89,18 @@ def _normalise_position(raw: Any) -> dict[str, Any]:
     return out
 
 
+def _pos_direction(p: dict[str, Any]) -> int:
+    """Return +1 for LONG/BUY, -1 for SHORT/SELL, or 0 if unknown."""
+    if p.get("direction") in (-1, 1):
+        return int(p["direction"])
+    side = str(p.get("side", "")).upper()
+    if side in ("BUY", "LONG"):
+        return 1
+    if side in ("SELL", "SHORT"):
+        return -1
+    return 0
+
+
 def _iso(ms: float) -> str:
     """UTC timestamp for log/verdict messages (never used for logic)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000.0))
@@ -277,6 +289,7 @@ class RiskState:
     cooldown_until_ms: int = 0
     last_trade_ms: int = 0
     kills: int = 0
+    daily_target_locked: bool = False
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -287,7 +300,9 @@ class RiskState:
         if not p.exists():
             return cls()
         try:
-            return cls(**json.loads(p.read_text()))
+            raw = json.loads(p.read_text())
+            known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
+            return cls(**known)
         except Exception:  # noqa: BLE001
             log.warning("risk state unreadable, starting fresh")
             return cls()
@@ -295,7 +310,9 @@ class RiskState:
     def save(self, path: str | Path) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp.replace(p)
 
 
 @dataclass(slots=True)
@@ -391,28 +408,67 @@ class RiskEngine:
         self._clock = clock
 
     # ------------------------------------------------------------------ account
-    def on_account(self, equity: float) -> None:
-        """Call once per loop with live equity: rolls the day, tracks peak."""
-        day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+    def on_account(self, equity: float, now_ms: int | None = None) -> None:
+        """Call once per loop with live equity: rolls the day, tracks peak, persists state."""
+        ts_sec = (now_ms / 1000.0) if now_ms is not None else float(self._clock())
+        day = time.strftime("%Y-%m-%d", time.gmtime(ts_sec))
+        dirty = False
         if self.state.day != day:
             self.state.day = day
             self.state.day_start_equity = equity
             self.state.intraday_peak_equity = equity
             self.state.realised_pnl_today = 0.0
             self.state.trades_today = 0
+            self.state.daily_target_locked = False
+            dirty = True
             log.info("new UTC trading day %s, equity %.2f", day, equity)
-        if equity > self.state.peak_equity:
+        if equity > self.state.peak_equity + 1e-6:
             self.state.peak_equity = equity
-        if equity > self.state.intraday_peak_equity:
+            dirty = True
+        elif equity > self.state.peak_equity:
+            self.state.peak_equity = equity
+        if equity > self.state.intraday_peak_equity + 1e-6:
             self.state.intraday_peak_equity = equity
-        if self.state.day_start_equity <= 0:
+            dirty = True
+        elif equity > self.state.intraday_peak_equity:
+            self.state.intraday_peak_equity = equity
+        if self.state.day_start_equity <= 0 and equity > 0:
             self.state.day_start_equity = equity
-        if self.state.intraday_peak_equity <= 0:
+            dirty = True
+        if self.state.intraday_peak_equity <= 0 and equity > 0:
             self.state.intraday_peak_equity = equity
+            dirty = True
         # The first equity we ever see is the deposit this account was funded
         # with; total-loss limits are measured from here, not from a rolling peak.
-        if self.state.initial_equity <= 0:
+        if self.state.initial_equity <= 0 and equity > 0:
             self.state.initial_equity = equity
+            dirty = True
+        if (
+            not self.state.daily_target_locked
+            and self.config.daily_profit_target_pct > 0
+            and self.state.day_start_equity > 0
+            and equity > 0
+        ):
+            day_gain = (equity - self.state.day_start_equity) / self.state.day_start_equity * 100.0
+            if day_gain >= self.config.daily_profit_target_pct - 1e-9:
+                self.state.daily_target_locked = True
+                dirty = True
+        if dirty:
+            try:
+                self.state.save(self.config.state_path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not persist risk state to %s: %s", self.config.state_path, exc)
+
+    def latch_daily_profit_target(self, reason: str = "") -> None:
+        """Persistently lock out new entries for the rest of the current UTC day."""
+        if not self.state.daily_target_locked:
+            self.state.daily_target_locked = True
+            if reason:
+                log.info("daily profit target latched for %s: %s", self.state.day, reason)
+            try:
+                self.state.save(self.config.state_path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not persist latched risk state: %s", exc)
 
     # -------------------------------------------------------------- blackout
     def blackout_status(self, now_ms: int) -> tuple[bool, str, float]:
@@ -612,41 +668,41 @@ class RiskEngine:
         # 7. exposure ----------------------------------------------------------
         positions = [_normalise_position(p) for p in (open_positions or [])]
         same_symbol = [p for p in positions if p.get("symbol") == symbol]
-        checks["max_positions"] = len(positions) < cfg.max_positions
+        # When hedging is disabled, LiveEngine closes opposite-side positions in
+        # `symbol` BEFORE sending the new order ("reverse handled by execution
+        # layer"). Concurrent slot & exposure caps must therefore measure the
+        # positions that will remain open alongside the new trade (`surviving`),
+        # otherwise every `max_positions=1` preset deadlocks on reversals.
+        reversing: list[dict[str, Any]] = []
+        if same_symbol and not cfg.allow_hedging and direction in (-1, 1):
+            reversing = [p for p in same_symbol if _pos_direction(p) == -direction]
+        reversing_ids = {id(p) for p in reversing}
+        surviving = [p for p in positions if id(p) not in reversing_ids]
+        surviving_same_symbol = [p for p in same_symbol if id(p) not in reversing_ids]
+        if reversing:
+            details["note"] = "reverse handled by execution layer"
+            details["reversing_notional"] = sum(p.get("notional", 0.0) for p in reversing)
+
+        checks["max_positions"] = len(surviving) < cfg.max_positions
         if not checks["max_positions"]:
             return verdict(RiskDecision.BLOCK, f"max positions ({cfg.max_positions}) reached")
         # With a single instrument, N positions in it is N times one bet -- so
         # the per-symbol cap is what limits the account, not max_positions.
         checks["max_positions_per_symbol"] = (
-            len(same_symbol) < cfg.max_positions_per_symbol
+            len(surviving_same_symbol) < cfg.max_positions_per_symbol
         )
         if not checks["max_positions_per_symbol"]:
             return verdict(
                 RiskDecision.BLOCK,
-                f"already {len(same_symbol)} position(s) in {symbol}, "
+                f"already {len(surviving_same_symbol)} position(s) in {symbol}, "
                 f"limit is {cfg.max_positions_per_symbol}",
             )
-        # A *single* position per symbol is a "one bet only" rule, so it lives
-        # with the per-symbol cap above. Here we only forbid the genuinely
-        # dangerous combination: piling a same-side bet onto an existing one
-        # beyond the cap, or hedging when hedging is off.
-        if same_symbol and not cfg.allow_hedging:
-            sides = {str(p.get("side", "")).upper() for p in same_symbol}
-            opposite = ("BUY" in sides and direction < 0) or ("SELL" in sides and direction > 0)
-            if opposite:
-                details["note"] = "reverse handled by execution layer"
-            elif len(same_symbol) >= cfg.max_positions_per_symbol:
-                return verdict(
-                    RiskDecision.FLAT,
-                    f"already {len(same_symbol)} position(s) in this symbol "
-                    f"(cap {cfg.max_positions_per_symbol})",
-                )
 
         # 8. correlation -------------------------------------------------------
         checks["correlation_ok"] = True
         for group in cfg.correlated_groups:
             if symbol in group:
-                others = [p.get("symbol") for p in positions if p.get("symbol") in group and p.get("symbol") != symbol]
+                others = [p.get("symbol") for p in surviving if p.get("symbol") in group and p.get("symbol") != symbol]
                 if others:
                     checks["correlation_ok"] = False
                     return verdict(
@@ -659,7 +715,7 @@ class RiskEngine:
         # invisible; with ten it means 10x the intended leverage, and with a
         # small account that is the difference between a bad day and a dead
         # account. Sum first, then decide.
-        open_notional = sum(p.get("notional", 0.0) for p in positions)
+        open_notional = sum(p.get("notional", 0.0) for p in surviving)
         ceiling_notional = equity * cfg.max_gross_exposure_pct / 100.0
         details["open_notional"] = open_notional
         details["gross_exposure_ceiling"] = ceiling_notional
@@ -670,7 +726,7 @@ class RiskEngine:
                 f"gross exposure ${open_notional:,.0f} already at/above the "
                 f"${ceiling_notional:,.0f} ceiling "
                 f"({cfg.max_gross_exposure_pct:g}% of equity) across "
-                f"{len(positions)} position(s)",
+                f"{len(surviving)} position(s)",
             )
 
         # 9. intraday brake ----------------------------------------------------
@@ -696,18 +752,22 @@ class RiskEngine:
             else 0.0
         )
         details["day_pnl_pct"] = day_pnl_pct
+        details["daily_target_locked"] = self.state.daily_target_locked
         checks["daily_loss_ok"] = day_pnl_pct > -cfg.max_daily_loss_pct
         if not checks["daily_loss_ok"]:
             self.kill.engage(f"daily loss {day_pnl_pct:.2f}%")
             return verdict(RiskDecision.BLOCK, f"daily loss {day_pnl_pct:.2f}% breached")
 
         if cfg.daily_profit_target_pct > 0 and self.state.day_start_equity > 0:
-            checks["daily_profit_target_ok"] = day_pnl_pct < (cfg.daily_profit_target_pct - 1e-9)
+            hit_now = day_pnl_pct >= (cfg.daily_profit_target_pct - 1e-9)
+            if hit_now and not self.state.daily_target_locked:
+                self.latch_daily_profit_target(f"+{day_pnl_pct:.2f}% >= +{cfg.daily_profit_target_pct:g}%")
+            checks["daily_profit_target_ok"] = not (self.state.daily_target_locked or hit_now)
             if not checks["daily_profit_target_ok"]:
                 return verdict(
                     RiskDecision.FLAT,
-                    f"daily profit target +{day_pnl_pct:.2f}% >= "
-                    f"+{cfg.daily_profit_target_pct:g}% locked -> pause until UTC rollover",
+                    f"daily profit target +{cfg.daily_profit_target_pct:g}% locked "
+                    f"(current {day_pnl_pct:+.2f}%) -> pause until UTC rollover",
                 )
 
         # 10b. drawdown --------------------------------------------------------
@@ -768,7 +828,7 @@ class RiskEngine:
         # the first order takes the entire ceiling and the second is refused:
         # "up to 10 positions" would be unreachable in practice even though
         # every guard says it is allowed.
-        slots_left = max(cfg.max_positions - len(positions), 1)
+        slots_left = max(cfg.max_positions - len(surviving), 1)
         per_slot = room / slots_left if cfg.split_exposure_across_slots else room
         max_notional = min(equity * cfg.max_leverage, per_slot)
         details["budget_per_slot"] = per_slot

@@ -464,22 +464,49 @@ def bias(
 @app.command()
 def trade(
     config: str = typer.Option("configs/live.hybrid.yaml"),
+    mode: str | None = typer.Option(
+        None,
+        "--mode",
+        help="explicit execution mode: 'paper' (dry-run) or 'live' (real orders; requires PX_LIVE_TRADING=1 and --i-understand-the-risk)",
+    ),
     i_understand_the_risk: bool = typer.Option(
         False, "--i-understand-the-risk", help="required to send real orders"
+    ),
+    max_bars: int | None = typer.Option(
+        None, "--max-bars", help="optional cap on decision cycles before exiting cleanly"
     ),
 ) -> None:
     """Start the live (or paper) scalping loop."""
     paths = _bootstrap()
     from .ops.live_runner import start_from_config
 
-    allow_live = (
-        os.getenv("PX_LIVE_TRADING", "0") == "1" and i_understand_the_risk
-    )
-    if os.getenv("PX_LIVE_TRADING", "0") == "1" and not i_understand_the_risk:
+    norm_mode = mode.strip().lower() if mode is not None else None
+    if norm_mode not in (None, "paper", "live"):
+        console.print(f"[red]--mode must be 'paper' or 'live', got {mode!r}[/red]")
+        raise typer.Exit(2)
+    if norm_mode == "paper" and i_understand_the_risk:
         console.print(
-            "[yellow]PX_LIVE_TRADING=1 but --i-understand-the-risk was not passed -> paper mode[/yellow]"
+            "[red]conflicting flags: --mode paper cannot be combined with --i-understand-the-risk[/red]"
         )
-    start_from_config(Path(config), allow_live=allow_live, paths=paths)
+        raise typer.Exit(2)
+
+    env_live = os.getenv("PX_LIVE_TRADING", "0") == "1"
+    if norm_mode == "paper":
+        allow_live = False
+    elif norm_mode == "live":
+        if not (env_live and i_understand_the_risk):
+            console.print(
+                "[red]--mode live requires BOTH PX_LIVE_TRADING=1 AND --i-understand-the-risk[/red]"
+            )
+            raise typer.Exit(2)
+        allow_live = True
+    else:
+        allow_live = env_live and i_understand_the_risk
+        if env_live and not i_understand_the_risk:
+            console.print(
+                "[yellow]PX_LIVE_TRADING=1 but --i-understand-the-risk was not passed -> paper mode[/yellow]"
+            )
+    start_from_config(Path(config), allow_live=allow_live, paths=paths, max_bars=max_bars)
 
 
 @app.command()
@@ -736,12 +763,66 @@ def risk_set(
 
 
 @app.command()
-def reconcile() -> None:
+def reconcile(
+    config: str = typer.Option(
+        "configs/live.hybrid.yaml", "--config", "-c", help="live YAML config for symbol/stop scope"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="inspect drift without cancelling orders or setting stops"
+    ),
+) -> None:
     """Compare the local journal with the exchange and fix drift."""
     _bootstrap()
+    import pandas as pd
+    import yaml
+
     from .live.reconcile import Reconciler
 
-    report = Reconciler(_client()).run()
+    client = _client()
+    cfg_path = Path(config)
+    symbols: list[str] | None = None
+    bar_size = "5M"
+    sl_atr = 1.0
+    state_path = Path("state/live_positions.json")
+    if cfg_path.exists():
+        raw = yaml.safe_load(cfg_path.read_text()) or {}
+        live_raw = raw.get("live", {}) or {}
+        risk_raw = raw.get("risk", {}) or {}
+        symbols = raw.get("symbols") or live_raw.get("symbols")
+        bar_size = str(live_raw.get("bar_size") or raw.get("bar_size") or "5M")
+        sl_atr = float(risk_raw.get("sl_atr", 1.0) or 1.0)
+        if live_raw.get("state_path"):
+            state_path = Path(live_raw["state_path"])
+
+    settings_by_symbol = {}
+    atr_by_symbol: dict[str, float] = {}
+    if not dry_run and symbols:
+        try:
+            settings_by_symbol = {s.symbol: s for s in client.settings(symbols=symbols)}
+        except Exception:  # noqa: BLE001
+            settings_by_symbol = {}
+        for sym in symbols:
+            try:
+                recent = client.bars(sym, bar_size, limit=30)
+                if recent and len(recent) >= 5:
+                    high = pd.Series([b.high for b in recent], dtype=float)
+                    low = pd.Series([b.low for b in recent], dtype=float)
+                    close = pd.Series([b.close for b in recent], dtype=float)
+                    prev = close.shift(1)
+                    tr = pd.concat(
+                        [high - low, (high - prev).abs(), (low - prev).abs()], axis=1
+                    ).max(axis=1)
+                    atr_by_symbol[sym] = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+            except Exception as exc:  # noqa: BLE001
+                console.log(f"[dim]ATR fetch skipped for {sym}: {exc}[/dim]")
+
+    report = Reconciler(client, state_path=state_path).run(
+        atr_by_symbol=atr_by_symbol,
+        sl_atr=sl_atr,
+        dry_run=dry_run,
+        allowed_symbols=symbols,
+        settings_by_symbol=settings_by_symbol,
+    )
     console.print_json(json.dumps(report.to_dict(), indent=2))
 
 

@@ -223,7 +223,9 @@ def run_backtest_from_config(
         horizon = int(raw.get("horizon", 5))
         labels = volatility_scaled_labels(bars, LabelConfig(horizon=horizon))
         common = features.index.intersection(labels.index)
-        windows, window_idx = engineer.make_windows(features.loc[common], lookback)
+        windows, window_idx = engineer.make_windows(
+            features.loc[common], lookback, contiguous=False
+        )
         frame = bars.loc[common].reset_index(drop=True)
         atr = labels.loc[common, "atr"].to_numpy()
         n = min(len(windows), len(window_idx))

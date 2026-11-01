@@ -245,7 +245,13 @@ class IntradayBiasEngine:
             htf_context_by_tf=htf_context,
         )
         last_row = mtf_df.iloc[-1]
-        htf_rv = float(last_row.get("htf_15m_xag_rv_z_2", 0.0))
+        rv_col = self.config.htf_rv_col
+        if rv_col not in last_row:
+            for candidate in ("htf_15m_xag_rv_z_2", "htf_5m_xag_rv_z_2"):
+                if candidate in last_row:
+                    rv_col = candidate
+                    break
+        htf_rv = float(last_row.get(rv_col, 0.0))
 
         ltf_rv = 0.0
         if bs_up == "1M" and "htf_5m_xag_rv_z_4" in last_row:

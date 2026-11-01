@@ -205,6 +205,7 @@ class Backtester:
         peak_equity = cfg.initial_equity
         current_utc_day: int | None = None
         day_start_equity = cfg.initial_equity
+        day_target_latched = False
         eff_mode = "fixed" if not cfg.compound else str(cfg.compound_mode).strip().lower()
         result = BacktestResult(config=cfg.to_dict())
         position: dict[str, Any] | None = None
@@ -217,6 +218,7 @@ class Backtester:
             if utc_day != current_utc_day:
                 current_utc_day = utc_day
                 day_start_equity = equity
+                day_target_latched = False
             window = windows[row]
             price_risk = max(atr[bar_idx], close[bar_idx] * 1e-6)
 
@@ -229,6 +231,7 @@ class Backtester:
                 reason = ""
                 side = position["side"]
                 target = position.get("target") if cfg.tp_atr > 0 else None
+                used_daily_target = False
                 if (
                     cfg.harvest_daily_profit_target
                     and cfg.daily_profit_target_pct > 0
@@ -252,6 +255,7 @@ class Backtester:
                             or (side < 0 and dp_px > target)
                         ):
                             target = float(dp_px)
+                            used_daily_target = True
 
                 stop_hit = (side > 0 and lo <= position["stop"]) or (
                     side < 0 and hi >= position["stop"]
@@ -320,6 +324,8 @@ class Backtester:
                     result.trades.append(trade)
                     equity = equity_now
                     peak_equity = max(peak_equity, equity)
+                    if reason == "target" and used_daily_target:
+                        day_target_latched = True
                     position = None
                     last_exit_time = int(times[bar_idx])
 
@@ -329,10 +335,9 @@ class Backtester:
                 if day_start_equity > 0
                 else 0.0
             )
-            day_locked = (
-                cfg.daily_profit_target_pct > 0
-                and day_pnl_pct >= cfg.daily_profit_target_pct - 1e-9
-            ) or (
+            if cfg.daily_profit_target_pct > 0 and day_pnl_pct >= cfg.daily_profit_target_pct - 1e-9:
+                day_target_latched = True
+            day_locked = day_target_latched or (
                 cfg.max_daily_loss_pct > 0
                 and day_pnl_pct <= -cfg.max_daily_loss_pct
             )

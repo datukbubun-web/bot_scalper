@@ -88,7 +88,9 @@ def main() -> int:
     )
     labels = volatility_scaled_labels(bars, LabelConfig(horizon=args.horizon))
     common = features.index.intersection(labels.index)
-    windows, end_idx = engineer.make_windows(features.loc[common], predictor.config.lookback)
+    windows, end_idx = engineer.make_windows(
+        features.loc[common], predictor.config.lookback, contiguous=False
+    )
     frame = bars.loc[common].reset_index(drop=True)
     atr = labels.loc[common, "atr"].to_numpy()
     n = min(len(windows), len(end_idx))

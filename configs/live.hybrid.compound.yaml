@@ -4,9 +4,9 @@
 #  Layer 2: Scalper Execution (5M ONNX Skip-TCN + Daily Compounding + DD-Scale)
 #
 #  PERINGATAN RISIKO: Preset agresif ini menargetkan rata-rata pertumbuhan majemuk
-#  ~3%/hari bursa pada data OOS XAU/USD dengan risk_per_trade_pct=11.0% dan
-#  leverage hingga 78x, disertai Anti-Martingale Drawdown Throttle otomatis.
-#  Drawdown historis OOS berada di kisaran ~15-16% (dapat lebih besar di live).
+#  ~3%/hari bursa pada data OOS XAU/USD dengan risk_per_trade_pct=9.8% dan
+#  leverage hingga 68x, disertai Anti-Martingale Drawdown Throttle otomatis.
+#  Drawdown historis OOS berada di kisaran ~13.7% (dapat lebih besar di live).
 # ─────────────────────────────────────────────────────────────────────────────
 
 symbols: ["XAU/USD"]
