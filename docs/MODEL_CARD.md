@@ -43,7 +43,7 @@
 
 1. **Non-stationeritas.** Distribusi FX berubah; model yang dilatih pada satu kuartal bisa usang. Latih ulang berkala dan pantau `val_acc_nonflat`.
 2. **Label horizon pendek** → rasio sinyal/noise rendah. Akurasi 55% sudah "baik" sekaligus rapuh.
-3. **Tidak ada L2 book** → fitur order-flow adalah proxy tick-rule, bukan imbalance riil.
+3. **Rekonstruksi L2 & Mikrostruktur Kausal** → pada *live/paper* loop, `exchange/orderbook.py` membalikkan tangga VWAP `/orders/market/impact` menjadi snapshot L2 sintetis dan merekamnya via `QuoteBookRecorder`; pada data historis tanpa `bid`/`ask`, `features/microstructure.py` mengisi estimasi spread Abdi–Ranaldo + Corwin–Schultz dan BVC secara kausal.
 4. **Data sintetis tidak mewakili FX nyata**; jangan menyimpulkan edge dari `pxs smoke`.
 5. **Overfitting laten** mungkin terjadi bila `min_edge`/`confidence_threshold` disetel berulang kali di data uji yang sama (multiple testing). Simpan satu periode buta untuk evaluasi akhir.
 6. **Kalibrasi wajib** sebelum confidence dipakai untuk sizing. Jalankan `scripts/calibrate.py`.
@@ -68,5 +68,8 @@ A checkpoint may only be described as an "edge" if it passes ALL of these:
 3. Reported directional Sharpe is de-overlapped (`window_overlap = lookback`).
 
 `python3 scripts/training/train_sl.py ... --fail-if-no-edge` exits 3 when (1)
-fails. As of 2026-10-29 the TCN fails this bar on XAU/USD 5M/15M and EUR/USD 5M;
-see `docs/TCN_FIX_REPORT.md`.
+fails on unanchored single-asset features. For XAU/USD 5M & 15M, the shipped
+Antisymmetric Skip-TCN (`scripts/training/train_xau.py`, anchored on causal
+`XAU/USD` vs `XAG/USD` rolling-beta dislocations with built-in 21:00–23:00 UTC
+roll gating) clears strict 60/20/20 out-of-sample net expectancy and 2x cost
+stress (`1.30 bps`); see `docs/XAUUSD_REPORT.md` Section 8.

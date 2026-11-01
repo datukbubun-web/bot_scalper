@@ -69,6 +69,17 @@ class ModelConfig:
     # shared
     head_hidden: int = 64
     use_layer_norm: bool = True
+    use_skip: bool = False
+    antisymmetric_head: bool = False
+    roll_gate_channel: int = -1
+    agree_ltf_channel: int = -1
+    agree_htf_channel: int = -1
+    vol_gate_channel: int = -1
+    max_vol_excess: float = 0.85
+    trend_guard_channel: int = -1
+    max_opposing_trend: float = 0.60
+    wick_confirm_channel: int = -1
+    min_wick_confirm: float = 0.05
 
     def to_dict(self) -> dict:
         d = self.__dict__.copy()
@@ -163,7 +174,24 @@ class TCN(nn.Module):
             in_ch = out_ch
         self.blocks = nn.Sequential(*layers)
         self.norm = nn.LayerNorm(in_ch) if config.use_layer_norm else nn.Identity()
-        self.head = ForecasterHead(in_ch, config.head_hidden, config.n_outputs, config.dropout)
+        self.use_skip = bool(config.use_skip)
+        self.antisymmetric_head = bool(config.antisymmetric_head)
+        self.roll_gate_channel = int(config.roll_gate_channel)
+        self.agree_ltf_channel = int(config.agree_ltf_channel)
+        self.agree_htf_channel = int(config.agree_htf_channel)
+        self.vol_gate_channel = int(config.vol_gate_channel)
+        self.max_vol_excess = float(config.max_vol_excess)
+        self.trend_guard_channel = int(config.trend_guard_channel)
+        self.max_opposing_trend = float(config.max_opposing_trend)
+        self.wick_confirm_channel = int(config.wick_confirm_channel)
+        self.min_wick_confirm = float(config.min_wick_confirm)
+        if self.antisymmetric_head and config.n_outputs == 3:
+            self.dir_head = nn.Linear(in_ch, 1, bias=False)
+            self.skip_dir = nn.Linear(config.n_features, 1, bias=False) if self.use_skip else None
+            self.flat_logit = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+        else:
+            self.head = ForecasterHead(in_ch, config.head_hidden, config.n_outputs, config.dropout)
+            self.skip_head = nn.Linear(config.n_features, config.n_outputs) if self.use_skip else None
 
     @property
     def receptive_field(self) -> int:
@@ -176,8 +204,43 @@ class TCN(nn.Module):
         # receptive field, so its last position summarises the whole window;
         # using it alone keeps the head small and the ONNX graph static.
         h = self.blocks(x)
-        last = h[:, :, -1]
-        return self.head(self.norm(last))
+        last = self.norm(h[:, :, -1])
+        x_last = x[:, :, -1]
+        if self.antisymmetric_head and self.config.n_outputs == 3:
+            score = self.dir_head(last)
+            if self.skip_dir is not None:
+                score = score + self.skip_dir(x_last)
+            if 0 <= self.roll_gate_channel < self.config.n_features:
+                gate = torch.clamp(1.0 - x_last[:, self.roll_gate_channel : self.roll_gate_channel + 1], 0.0, 1.0)
+                score = score * gate
+            if (
+                0 <= self.agree_ltf_channel < self.config.n_features
+                and 0 <= self.agree_htf_channel < self.config.n_features
+            ):
+                ltf_v = x_last[:, self.agree_ltf_channel : self.agree_ltf_channel + 1]
+                htf_v = x_last[:, self.agree_htf_channel : self.agree_htf_channel + 1]
+                agree = (ltf_v * htf_v >= 0.0).to(score.dtype)
+                score = score * agree
+            if 0 <= self.vol_gate_channel < self.config.n_features:
+                vol_ex = x_last[:, self.vol_gate_channel : self.vol_gate_channel + 1]
+                vol_ok = (torch.abs(vol_ex) <= self.max_vol_excess).to(score.dtype)
+                score = score * vol_ok
+            if 0 <= self.trend_guard_channel < self.config.n_features:
+                tr_v = x_last[:, self.trend_guard_channel : self.trend_guard_channel + 1]
+                s_unit = score / (torch.abs(score) + 1e-9)
+                tr_ok = (s_unit * tr_v >= -self.max_opposing_trend).to(score.dtype)
+                score = score * tr_ok
+            if 0 <= self.wick_confirm_channel < self.config.n_features:
+                wk_v = x_last[:, self.wick_confirm_channel : self.wick_confirm_channel + 1]
+                s_unit = score / (torch.abs(score) + 1e-9)
+                wk_ok = (s_unit * wk_v >= self.min_wick_confirm).to(score.dtype)
+                score = score * wk_ok
+            flat = self.flat_logit.expand_as(score)
+            return torch.cat([-score, flat, score], dim=-1)
+        out = self.head(last)
+        if self.skip_head is not None:
+            out = out + self.skip_head(x_last)
+        return out
 
 
 # --------------------------------------------------------------------- LSTM / GRU

@@ -19,10 +19,36 @@
   "clip_sigma": 8.0,
   "include_time_features": true,
   "include_quote_features": true,
-  "include_context_features": false,
-  "context_config": {},
-  "include_calendar_features": false,
+  "synthetic_microstructure": true,
+  "include_context_features": true,
+  "context_config": {
+    "symbols": {
+      "XAG/USD": "xag"
+    },
+    "zscore_window": 288,
+    "min_coverage": 0.25,
+    "include_rv_features": true,
+    "rv_windows": [
+      1,
+      4,
+      12
+    ],
+    "rv_norm_window": 144
+  },
+  "include_calendar_features": true,
   "calendar_config": {},
+  "include_gold_session_features": true,
+  "include_mtf_bias_features": true,
+  "mtf_bias_config": {
+    "htf_bar_sizes": [
+      "15M"
+    ],
+    "context_symbols": {
+      "XAG/USD": "xag"
+    },
+    "min_coverage": 0.25
+  },
+  "bar_size": "5M",
   "session_windows": {
     "asia": [
       0,

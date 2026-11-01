@@ -1,17 +1,15 @@
 {
   "arch": "tcn",
-  "torchscript_path": "/home/user/pxscalper/artifacts/models/latest/tcn.ts",
-  "onnx_path": "/home/user/pxscalper/artifacts/models/latest/tcn.onnx",
+  "torchscript_path": "tcn.ts",
+  "onnx_path": "tcn.onnx",
   "model_config": {
-    "n_features": 38,
+    "n_features": 76,
     "lookback": 64,
     "n_outputs": 3,
     "task": "classification",
     "channels": [
-      64,
-      64,
-      64,
-      64
+      16,
+      16
     ],
     "kernel_size": 3,
     "dropout": 0.1,
@@ -23,36 +21,50 @@
     "n_heads": 4,
     "n_layers": 2,
     "ff_mult": 2,
-    "head_hidden": 64,
-    "use_layer_norm": true
+    "head_hidden": 16,
+    "use_layer_norm": true,
+    "use_skip": true,
+    "antisymmetric_head": true,
+    "roll_gate_channel": 75,
+    "agree_ltf_channel": -1,
+    "agree_htf_channel": -1,
+    "vol_gate_channel": -1,
+    "max_vol_excess": 0.85,
+    "trend_guard_channel": -1,
+    "max_opposing_trend": 0.6,
+    "wick_confirm_channel": -1,
+    "min_wick_confirm": 0.05
   },
   "latency_us": {
     "pytorch_eager": {
-      "mean_us": 1109.254159,
-      "p50_us": 1076.495,
-      "p90_us": 1249.3576000000003,
-      "p99_us": 1858.6272699999997,
-      "max_us": 2916.137
+      "mean_us": 589.4778066666667,
+      "p50_us": 588.8340000000001,
+      "p90_us": 661.1862,
+      "p99_us": 781.0437899999997,
+      "max_us": 943.453
     },
     "torchscript": {
-      "mean_us": 946.9742285,
-      "p50_us": 901.335,
-      "p90_us": 1087.8366000000003,
-      "p99_us": 1810.8292199999999,
-      "max_us": 5787.911
+      "mean_us": 344.30689,
+      "p50_us": 323.7595,
+      "p90_us": 393.9422,
+      "p99_us": 453.5213699999996,
+      "max_us": 712.633
     },
     "onnxruntime": {
-      "mean_us": 249.7009115,
-      "p50_us": 238.3655,
-      "p90_us": 297.41020000000003,
-      "p99_us": 427.09876999999994,
-      "max_us": 599.624
+      "mean_us": 90.66828666666667,
+      "p50_us": 83.579,
+      "p90_us": 117.14270000000003,
+      "p99_us": 133.83359,
+      "max_us": 154.393
     },
     "_summary": {
-      "p99_speedup_onnx_vs_eager": 4.35,
-      "iterations": 2000,
+      "p99_speedup_onnx_vs_eager": 5.84,
+      "iterations": 300,
       "on_cpu_threads": 2
     }
   },
-  "onnx_opsets": null
+  "onnx_opsets": null,
+  "symbol": "XAU/USD",
+  "bar_size": "15M",
+  "architecture_mode": "15M"
 }

@@ -55,6 +55,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "BarrierConfig",
     "barrier_outcome",
+    "barrier_y_to_dir",
     "directed_barrier_labels",
     "barrier_stats",
 ]
@@ -179,6 +180,21 @@ def barrier_outcome(
     )
 
 
+def barrier_y_to_dir(y: pd.Series | np.ndarray) -> np.ndarray:
+    """Convert barrier classes ``{0=flat, 1=short, 2=long}`` to ``{-1, 0, +1}``.
+
+    ``WindowDataset`` and ``Predictor`` use ``{-1=short, 0=flat, +1=long}``
+    (shifted +1 to ``{0=short, 1=flat, 2=long}``). Passing raw ``targets['y']``
+    into ``WindowDataset`` without converting flips flat and short! Always pass
+    ``targets['y_dir']`` or ``barrier_y_to_dir(targets['y'])`` to ``Trainer``.
+    """
+    arr = np.asarray(y, dtype=np.float64)
+    out = np.zeros(len(arr), dtype=np.int64)
+    out[arr == 1] = -1
+    out[arr == 2] = 1
+    return out
+
+
 def directed_barrier_labels(
     bars: pd.DataFrame, config: BarrierConfig | None = None
 ) -> pd.DataFrame:
@@ -228,6 +244,7 @@ def directed_barrier_labels(
     out = pd.DataFrame(
         {
             "y": y,
+            "y_dir": barrier_y_to_dir(y),
             "ret_long_bps": ret_long_bps,
             "ret_short_bps": ret_short_bps,
             "tp_bps": tp_bps,

@@ -28,8 +28,10 @@ log = logging.getLogger(__name__)
 
 __all__ = ["Instrument", "SymbolResolver", "resolve_units"]
 
-#: categories that are genuinely FX
-FX_CATEGORIES = {"forex"}
+#: categories that are genuinely FX / spot precious metals
+FX_CATEGORIES = {"forex", "metals", "spot metals", "bullion"}
+#: ISO precious-metal base codes traded alongside FX spot
+PRECIOUS_METALS = {"XAU", "XAG", "XPT", "XPD"}
 #: quote currencies that settle in USD (PnL per unit = 1.0)
 USD_QUOTES = {"USD", "USDT", "USDC"}
 
@@ -54,9 +56,12 @@ class Instrument:
 
     @property
     def is_fx(self) -> bool:
-        return self.category.lower() in FX_CATEGORIES or (
-            self.market_type.upper() == "FOREX" and self.base and self.quote
-        )
+        cat = self.category.lower()
+        if cat in FX_CATEGORIES:
+            return True
+        if self.base.upper() in PRECIOUS_METALS and self.quote.upper() in USD_QUOTES:
+            return True
+        return self.market_type.upper() == "FOREX" and bool(self.base and self.quote)
 
     @property
     def qty_step(self) -> float:

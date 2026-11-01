@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  pxscalper -- Arsitektur Hybrid Standar ($10.000):
+#  Layer 1: Intraday Bias (15M Cross-Metal Fair-Value + Session VWAP + VolRegime)
+#  Layer 2: Scalper Execution (5M ONNX Skip-TCN + Microstructure + Tight Risk)
+# ─────────────────────────────────────────────────────────────────────────────
+
+symbols: ["XAU/USD"]
+bar_size: "5M"
+lookback: 64
+horizon: 12
+
+live:
+  symbols: ["XAU/USD"]
+  bar_size: "5M"
+  lookback: 64
+  warmup_bars: 900
+  settle_ms: 1200
+  loop_sleep_s: 2.5
+  max_hold_bars: 12
+  trailing_stop_atr: 0.0
+  l2_probe_interval_s: 60.0
+  l2_probe_ladder: [0.01, 0.1, 1.0, 10.0]
+
+inference:
+  arch: "tcn"
+  backend: "onnx"
+  model_dir: "artifacts/xau_hybrid_5M"
+  confidence_threshold: 0.45
+  edge_threshold: 0.03
+  threads: 1
+
+strategy:
+  kind: "hybrid"
+  min_confidence: 0.45
+  min_edge: 0.03
+  require_rl_agreement: false
+  size_by_edge: false
+  min_seconds_between_trades: 5.0
+  cooldown_after_loss_s: 30.0
+  max_hold_bars: 12
+
+hybrid:
+  enabled: true
+  require_composite_threshold: true
+  composite_threshold: 1.85
+  require_micro_absorption: false
+  modulate_size_by_bias: false
+  bias:
+    htf_bar_size: "15M"
+    htf_rv_col: "htf_15m_xag_rv_z_2"
+    ltf_rv_col: "ctx_xag_rv_z_4"
+    ltf_weight: 0.65
+    htf_weight: 0.35
+    max_opposing_session_trend: 0.60
+    max_vol_regime_ratio: 1.85
+    min_vol_regime_ratio: 0.15
+    require_htf_non_opposing: true
+
+risk:
+  single_symbol: true
+  allowed_symbols: ["XAU/USD"]
+  risk_per_trade_pct: 0.5
+  max_leverage: 5.0
+  max_positions: 1
+  max_positions_per_symbol: 1
+  max_gross_exposure_pct: 300.0
+  sl_atr: 4.5
+  tp_atr: 6.0
+  max_holding_bars: 12
+  max_daily_loss_pct: 2.5
+  max_drawdown_pct: 6.0
+  max_daily_trades: 12
+  consecutive_loss_cooldown: 3
+  cooldown_minutes: 60
+  blackout_enabled: true
+  blackout_pre_min: 15
+  blackout_post_min: 15
+  blackout_kinds: ["nfp", "cpi", "fomc"]
+  max_spread_bps: 1.5
+  min_atr_bps: 1.5
+  max_atr_bps: 15.0
+  min_confidence: 0.45
+  min_edge: 0.03
+  allow_hedging: false
+
+execution:
+  use_limit_orders: false
+  max_spread_bps: 1.5
+  attach_protection: true
+  verify_fills: true
+  verify_timeout_s: 3.0
+  max_impact_vwap_bps: 2.0
+
+backtest:
+  initial_equity: 10000.0
+  taker_fee_pct: 0.0
+  slippage_coef: 0.0
+  spread_bps_fallback: 0.65
+  risk_per_trade_pct: 0.5
+  sl_atr: 4.5
+  tp_atr: 6.0
+  max_holding_bars: 12
+  min_confidence: 0.45
+  min_edge: 0.03
+  align_to_context_span: true

@@ -57,6 +57,7 @@ class TrainConfig:
     seed: int = 7
     mixed_precision: bool = False
     log_every: int = 0
+    bars_per_year: float | None = None
 
 
 class WindowDataset(Dataset):
@@ -65,10 +66,16 @@ class WindowDataset(Dataset):
     def __init__(self, windows: np.ndarray, labels: np.ndarray, n_classes: int = 3) -> None:
         assert len(windows) == len(labels), "windows/labels length mismatch"
         self.windows = torch.from_numpy(np.ascontiguousarray(windows, dtype=np.float32))
+        arr = np.asarray(labels)
         if n_classes == 3:
-            self.labels = torch.from_numpy(np.ascontiguousarray(labels + 1, dtype=np.int64))
+            if arr.size > 0 and arr.min() >= 0 and arr.max() >= 2:
+                raise ValueError(
+                    "3-class WindowDataset expects directional labels in {-1, 0, +1}, "
+                    "not {0, 1, 2}. Pass targets['y_dir'] or barrier_y_to_dir(targets['y'])."
+                )
+            self.labels = torch.from_numpy(np.ascontiguousarray(arr + 1, dtype=np.int64))
         else:
-            self.labels = torch.from_numpy(np.ascontiguousarray(labels, dtype=np.int64))
+            self.labels = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
 
     def __len__(self) -> int:
         return self.windows.shape[0]
@@ -78,7 +85,13 @@ class WindowDataset(Dataset):
 
 
 def class_weights(labels: np.ndarray, n_classes: int = 3) -> torch.Tensor:
-    counts = np.bincount(np.asarray(labels + 1 if n_classes == 3 else labels), minlength=n_classes)
+    arr = np.asarray(labels)
+    if n_classes == 3 and arr.size > 0 and arr.min() >= 0 and arr.max() >= 2:
+        raise ValueError(
+            "3-class class_weights expects directional labels in {-1, 0, +1}, "
+            "not {0, 1, 2}. Pass targets['y_dir'] or barrier_y_to_dir(targets['y'])."
+        )
+    counts = np.bincount(arr + 1 if n_classes == 3 else arr, minlength=n_classes)
     counts = np.maximum(counts, 1)
     weights = counts.sum() / (n_classes * counts)
     return torch.tensor(weights, dtype=torch.float32)
@@ -185,7 +198,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.lr, weight_decay=config.weight_decay
         )
-        self.ema = _EMA(model, config.ema_decay)
+        self.ema = _EMA(model, config.ema_decay, warmup=config.ema_warmup)
 
     # ------------------------------------------------------------------ schedule
     def _lr_lambda(self, step: int, total: int) -> float:
@@ -354,7 +367,11 @@ class Trainer:
         pnl = self._trade_pnls(model, loader, y_ret)
         if pnl.size < 2 or pnl.std() == 0:
             return 0.0
-        return float(pnl.mean() / pnl.std() * math.sqrt(252 * 390))
+        if self.config.bars_per_year is not None:
+            ann = max(self.config.bars_per_year / max(self.window_overlap, 1), 1.0)
+        else:
+            ann = float(252 * 390)
+        return float(pnl.mean() / pnl.std() * math.sqrt(ann))
 
     # --------------------------------------------------------------------- save
     def save(self, path: str | Path, meta: dict | None = None) -> None:

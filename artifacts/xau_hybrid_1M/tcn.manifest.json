@@ -1,0 +1,70 @@
+{
+  "arch": "tcn",
+  "torchscript_path": "tcn.ts",
+  "onnx_path": "tcn.onnx",
+  "model_config": {
+    "n_features": 74,
+    "lookback": 64,
+    "n_outputs": 3,
+    "task": "classification",
+    "channels": [
+      16,
+      16
+    ],
+    "kernel_size": 3,
+    "dropout": 0.1,
+    "rnn_type": "lstm",
+    "hidden_size": 64,
+    "num_layers": 1,
+    "patch_len": 8,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "ff_mult": 2,
+    "head_hidden": 16,
+    "use_layer_norm": true,
+    "use_skip": true,
+    "antisymmetric_head": true,
+    "roll_gate_channel": 63,
+    "agree_ltf_channel": 65,
+    "agree_htf_channel": 68,
+    "vol_gate_channel": 72,
+    "max_vol_excess": 0.85,
+    "trend_guard_channel": 71,
+    "max_opposing_trend": 0.6,
+    "wick_confirm_channel": 14,
+    "min_wick_confirm": 0.03
+  },
+  "latency_us": {
+    "pytorch_eager": {
+      "mean_us": 732.5596066666666,
+      "p50_us": 729.175,
+      "p90_us": 801.4024000000001,
+      "p99_us": 828.8333899999999,
+      "max_us": 926.217
+    },
+    "torchscript": {
+      "mean_us": 424.77144666666663,
+      "p50_us": 415.396,
+      "p90_us": 465.1513,
+      "p99_us": 514.9866699999999,
+      "max_us": 616.805
+    },
+    "onnxruntime": {
+      "mean_us": 110.12872333333333,
+      "p50_us": 102.85300000000001,
+      "p90_us": 139.95080000000002,
+      "p99_us": 157.24178,
+      "max_us": 168.985
+    },
+    "_summary": {
+      "p99_speedup_onnx_vs_eager": 5.27,
+      "iterations": 300,
+      "on_cpu_threads": 2
+    }
+  },
+  "onnx_opsets": null,
+  "symbol": "XAU/USD",
+  "bar_size": "1M",
+  "architecture_mode": "HYBRID_1M"
+}

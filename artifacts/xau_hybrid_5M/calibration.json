@@ -1,0 +1,14 @@
+{
+  "temperature": 1.0499957737235348,
+  "platt_a": 1.0,
+  "platt_b": 0.0,
+  "symbol": "XAU/USD",
+  "arch": "tcn",
+  "brier_before": 0.36915868177968875,
+  "brier_after": 0.3627302569680906,
+  "n_active_val": 93,
+  "slice": [
+    0.6,
+    0.8
+  ]
+}

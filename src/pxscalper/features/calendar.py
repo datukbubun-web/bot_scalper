@@ -123,6 +123,10 @@ class CalendarConfig:
     #: cap for |minutes to next| so the feature stays bounded far from events
     cap_minutes: float = 1440.0
     include_event_day: bool = True
+    #: optional external CSV schedule ("kind,iso_utc") overriding BUILTIN_SCHEDULE
+    schedule_path: str | None = None
+    #: emit a warning when queried timestamps fall outside the schedule's year span
+    warn_out_of_range: bool = True
 
 
 class MacroCalendar:
@@ -183,6 +187,11 @@ class MacroCalendar:
         hi = np.searchsorted(arr, end_ms, side="right")
         return int(hi - lo)
 
+    def covered_range_ms(self) -> tuple[int, int] | None:
+        if not self.events:
+            return None
+        return self.events[0].time_ms, self.events[-1].time_ms
+
 
 def calendar_feature_names(config: CalendarConfig | None = None) -> tuple[str, ...]:
     """Column names produced by :func:`calendar_features`, derived from config."""
@@ -217,8 +226,23 @@ def calendar_features(
     shortest active pre-window in minutes, 0 when none).
     """
     cfg = config or CalendarConfig()
-    cal = calendar or MacroCalendar()
+    if calendar is not None:
+        cal = calendar
+    elif cfg.schedule_path:
+        cal = MacroCalendar.from_csv(cfg.schedule_path)
+    else:
+        cal = MacroCalendar()
     t = np.asarray(times_ms, dtype=np.int64)
+    if cfg.warn_out_of_range and t.size > 0:
+        span = cal.covered_range_ms()
+        margin_ms = 35 * 86_400_000
+        if span is not None and (int(t.min()) < span[0] - margin_ms or int(t.max()) > span[1] + margin_ms):
+            log.warning(
+                "calendar_features queried outside schedule span [%s .. %s]; "
+                "update BUILTIN_SCHEDULE or pass CalendarConfig.schedule_path",
+                pd.Timestamp(span[0], unit="ms", tz="UTC").date(),
+                pd.Timestamp(span[1], unit="ms", tz="UTC").date(),
+            )
     out = pd.DataFrame(index=pd.RangeIndex(len(t)))
     cap = float(cfg.cap_minutes)
 

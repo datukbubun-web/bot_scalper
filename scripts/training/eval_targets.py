@@ -145,15 +145,21 @@ def main() -> int:
 
     common = features.index.intersection(labels.index)
     windows, idx = engineer.make_windows(features.loc[common], args.lookback)
-    pos = {int(t): i for i, t in enumerate(common)}
-    rows = np.array([pos[int(t)] for t in idx], dtype=int)
+    rows = np.asarray(idx, dtype=int)
+    n_w = min(len(windows), len(rows))
+    windows, rows = windows[:n_w], rows[:n_w]
     y_raw = labels.loc[common, "y"].to_numpy()[rows].astype(int)
+    y_dir_all = labels.loc[common, "y_dir"].to_numpy()[rows].astype(int)
+    fwd_ret_all = (
+        bars.loc[common, "close"].pct_change(args.horizon).shift(-args.horizon).fillna(0.0).to_numpy()[rows]
+    )
     purge = args.lookback + args.horizon
     split = int(len(windows) * 0.8)
-    tr_end = split - purge
+    tr_end = max(split - purge, 1)
     x_tr, y_tr = windows[:tr_end], y_raw[:tr_end]
     x_va, y_va = windows[split:], y_raw[split:]
-    r_va = labels.loc[common, "y"].to_numpy()[rows][split:]
+    ydir_tr, ydir_va = y_dir_all[:tr_end], y_dir_all[split:]
+    r_va = fwd_ret_all[split:]
     print(f"\ntrain {len(x_tr)} | purge {purge} | val {len(x_va)}")
     print(f"kelas val: {np.bincount(y_va, minlength=3).tolist()} (0=tidak entry, 1=short, 2=long)")
 
@@ -180,7 +186,7 @@ def main() -> int:
         ("logistic, fitur bar terakhir", x_tr[:, :, -1], x_va[:, :, -1]),
         ("logistic, fitur dirata-rata 8 bar", x_tr[:, :, -8:].mean(2), x_va[:, :, -8:].mean(2)),
     ):
-        clf = LogisticRegression(max_iter=4000, C=0.1, multi_class="multinomial").fit(feat_tr, y_tr)
+        clf = LogisticRegression(max_iter=4000, C=0.1).fit(feat_tr, y_tr)
         results.append(evaluate_signal(label, y_va, clf.predict_proba(feat_va), r_long, r_short))
 
     # -- optional TCN --------------------------------------------------------
@@ -193,16 +199,18 @@ def main() -> int:
                            dropout=0.2)
         model = build_sequence_model("tcn", mcfg)
         trainer = Trainer(model, TrainConfig(epochs=10, batch_size=128, lr=3e-4, patience=3),
-                          class_weights(y_tr), window_overlap=args.lookback)
-        hist = trainer.fit(WindowDataset(x_tr, y_tr), WindowDataset(x_va, y_va), y_ret=r_va)
+                          class_weights(ydir_tr), window_overlap=args.lookback)
+        hist = trainer.fit(WindowDataset(x_tr, ydir_tr), WindowDataset(x_va, ydir_va), y_ret=r_va)
         logits = []
         trainer.ema.shadow.eval()
         import torch
         with torch.no_grad():
             for i in range(0, len(x_va), 512):
                 logits.append(trainer.ema.shadow(torch.from_numpy(x_va[i:i + 512])).numpy())
-        prob = torch.softmax(torch.from_numpy(np.concatenate(logits)), -1).numpy()
-        results.append(evaluate_signal("TCN 32ch", y_va, prob, r_long, r_short))
+        prob_dir = torch.softmax(torch.from_numpy(np.concatenate(logits)), -1).numpy()
+        # Map TCN columns [0=short, 1=flat, 2=long] -> barrier columns [0=flat, 1=short, 2=long]
+        prob_barrier = prob_dir[:, [1, 0, 2]]
+        results.append(evaluate_signal("TCN 32ch", y_va, prob_barrier, r_long, r_short))
         print(f"  TCN beat baseline: {hist.beat_baseline}")
 
     print(f"\n{'model':38s} {'log-loss':>9s} {'acc':>6s} {'trades':>7s} {'rate':>6s} "

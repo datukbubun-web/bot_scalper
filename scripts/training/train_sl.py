@@ -91,12 +91,11 @@ def main() -> int:
     labels = volatility_scaled_labels(bars, LabelConfig(horizon=args.horizon))
     common = features.index.intersection(labels.index)
     windows, window_times = engineer.make_windows(features.loc[common], args.lookback)
-    pos = {int(t): i for i, t in enumerate(common)}
-    rows = np.array([pos[int(t)] for t in window_times if int(t) in pos], dtype=int)
+    rows = np.asarray(window_times, dtype=int)
     n = min(len(windows), len(rows))
     windows, rows = windows[:n], rows[:n]
-    y = labels["y_dir"].to_numpy()[rows]
-    y_ret = labels["y_ret"].to_numpy()[rows]
+    y = labels.loc[common, "y_dir"].to_numpy()[rows]
+    y_ret = labels.loc[common, "y_ret"].to_numpy()[rows]
     print(f"windows: {windows.shape} | class balance: {dict(zip(*np.unique(y, return_counts=True)))}")
 
     # ----------------------------------------------------------------- model
@@ -168,6 +167,12 @@ def main() -> int:
         from pxscalper.inference.export import export_all
 
         result = export_all(ckpt, args.arch, model_dir, iterations=2000)
+        mpath = model_dir / f"{args.arch}.manifest.json"
+        if mpath.exists():
+            mraw = json.loads(mpath.read_text())
+            mraw["symbol"] = args.symbol
+            mraw["bar_size"] = args.bars
+            mpath.write_text(json.dumps(mraw, indent=2))
         print(json.dumps(result.latency_us, indent=2))
     return 0
 

@@ -66,7 +66,7 @@ def main() -> int:
     features = engineer.transform_normalized(bars)
     labels = volatility_scaled_labels(bars, LabelConfig())
     common = features.index.intersection(labels.index)
-    frame = bars.set_index("time").loc[common]
+    frame = bars.loc[common].reset_index(drop=True)
 
     env = FXScalpEnv(
         features=features.loc[common].to_numpy(dtype=np.float32),

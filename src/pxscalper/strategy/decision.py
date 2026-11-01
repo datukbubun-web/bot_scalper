@@ -32,6 +32,20 @@ log = logging.getLogger(__name__)
 __all__ = ["Intent", "Decision", "StrategyConfig", "ScalpingStrategy"]
 
 
+def _decode_rl_output(policy: Any, raw_out: Any) -> float:
+    """Normalise continuous float policies and discrete tuple-returning PPOAgent."""
+    val = raw_out[0] if isinstance(raw_out, tuple) else raw_out
+    is_discrete = (
+        getattr(policy, "continuous", None) is False
+        or getattr(getattr(policy, "cfg", None), "continuous", None) is False
+        or (isinstance(val, (int, np.integer)) and int(val) in (0, 1, 2))
+    )
+    if is_discrete:
+        a = int(np.asarray(val).reshape(-1)[0])
+        return {0: 0.0, 1: 1.0, 2: -1.0}.get(a, 0.0)
+    return float(np.asarray(val).reshape(-1)[0])
+
+
 class Intent(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
@@ -163,7 +177,7 @@ class ScalpingStrategy:
         size_mult = 1.0
         rl_action: float | None = None
         if self.rl_policy is not None and rl_observation is not None:
-            rl_action = float(self.rl_policy.act(rl_observation))
+            rl_action = _decode_rl_output(self.rl_policy, self.rl_policy.act(rl_observation))
             meta["rl_action"] = round(rl_action, 4)
             agrees = np.sign(rl_action) == np.sign(pred.direction)
             if not agrees or abs(rl_action) < cfg.rl_neutral_band:

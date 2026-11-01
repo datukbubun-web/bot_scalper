@@ -199,14 +199,151 @@ def smoke(
 def backtest(
     config: str = typer.Option("configs/live.example.yaml"),
     synthetic: bool = typer.Option(False, help="use synthetic data instead of cache"),
+    oos_frac: float = typer.Option(
+        0.0, "--oos-frac", help="evaluate only the last fraction of windows (e.g. 0.40)"
+    ),
 ) -> None:
     """Walk-forward backtest using cached (or synthetic) data."""
     _bootstrap()
     from .ops.backtest_runner import run_backtest_from_config
 
-    result = run_backtest_from_config(Path(config), synthetic=synthetic)
+    result = run_backtest_from_config(Path(config), synthetic=synthetic, oos_frac=oos_frac)
     console.print(result.summary())
     console.print(f"[dim]trades={len(result.trades)} metrics written to artifacts/[/dim]")
+
+
+@app.command()
+def orderbook(
+    symbol: str = typer.Option("XAU/USD", help="symbol to probe"),
+    ladder: str = typer.Option("0.01,0.1,1,10,50", help="comma-separated size ladder"),
+) -> None:
+    """Reconstruct PrimeXBT's internal L2 order book via /quotes + /impact VWAP inversion."""
+    _bootstrap()
+    from .exchange.orderbook import probe_synthetic_orderbook
+
+    sizes = [float(x.strip()) for x in ladder.split(",") if x.strip()]
+    snap = probe_synthetic_orderbook(_client(), symbol, size_ladder=sizes)
+    if snap is None:
+        console.print(f"[red]could not probe order book for {symbol}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[bold]{snap.symbol}[/bold] bid={snap.bid:,.4f} | ask={snap.ask:,.4f} | "
+        f"spread={snap.spread_bps:.2f} bps | L2 imbalance={snap.l2_imbalance:+.3f} | "
+        f"slopes (bid/ask)={snap.bid_slope_bps:.4f}/{snap.ask_slope_bps:.4f} bps/unit"
+    )
+    table = Table(title=f"Synthetic L2 Slices — {snap.symbol}", show_header=True, header_style="bold")
+    for col in ("side", "cum_qty", "slice_qty", "vwap_px", "marginal_px", "offset_bps"):
+        table.add_column(col, justify="right" if col != "side" else "left")
+    for lvl in reversed(snap.asks):
+        table.add_row(
+            "[red]ASK[/red]",
+            f"{lvl.cumulative_qty:g}",
+            f"{lvl.slice_qty:g}",
+            f"{lvl.vwap_price:,.4f}",
+            f"{lvl.marginal_price:,.4f}",
+            f"{lvl.offset_bps:+.2f}",
+        )
+    for lvl in snap.bids:
+        table.add_row(
+            "[green]BID[/green]",
+            f"{lvl.cumulative_qty:g}",
+            f"{lvl.slice_qty:g}",
+            f"{lvl.vwap_price:,.4f}",
+            f"{lvl.marginal_price:,.4f}",
+            f"{lvl.offset_bps:+.2f}",
+        )
+    console.print(table)
+
+
+@app.command()
+def bias(
+    symbol: str = typer.Option("XAU/USD", help="primary symbol"),
+    bars: str = typer.Option("5M", help="scalper execution bar size (1M | 5M)"),
+    htf: str = typer.Option("15M", help="intraday bias higher timeframe"),
+    context_symbol: str = typer.Option("XAG/USD", help="cross-asset fair-value driver"),
+) -> None:
+    """Inspect causal Hybrid Intraday Bias + Scalper Execution state on cached data."""
+    paths = _bootstrap()
+    import pandas as pd
+
+    from .data.pipeline import DataPipeline
+    from .features.mtf import resample_ohlcv_causal
+    from .strategy.intraday_bias import IntradayBiasConfig, IntradayBiasEngine
+
+    pipe = DataPipeline(cache_dir=paths.data)
+    bs_up = bars.upper()
+    htf_up = htf.upper()
+    ltf_df = pipe.load(symbol, bs_up)
+    if ltf_df is None or ltf_df.empty:
+        console.print(f"[red]no cached {symbol} {bs_up} data in {paths.data}[/red]")
+        raise typer.Exit(1)
+
+    ctx_df = pipe.load(context_symbol, bs_up)
+    if ctx_df is None and bs_up != "1M":
+        raw1 = pipe.load(context_symbol, "1M")
+        if raw1 is not None and not raw1.empty:
+            ctx_df = resample_ohlcv_causal(raw1, bs_up, source_bar_size="1M", drop_incomplete=True)
+
+    htf_p = pipe.load(symbol, htf_up)
+    htf_c = pipe.load(context_symbol, htf_up)
+    if (htf_c is None or htf_c.empty) and context_symbol:
+        src5 = pipe.load(context_symbol, "5M")
+        if src5 is not None and not src5.empty:
+            htf_c = resample_ohlcv_causal(src5, htf_up, source_bar_size="5M", drop_incomplete=True)
+
+    ltf_tail = ltf_df.tail(2500).reset_index(drop=True)
+    ctx_map = {context_symbol: ctx_df} if ctx_df is not None and not ctx_df.empty else None
+    htf_bars_map = {htf_up: htf_p} if htf_p is not None and not htf_p.empty else None
+    htf_ctx_map = (
+        {htf_up: {context_symbol: htf_c}} if htf_c is not None and not htf_c.empty else None
+    )
+    if bs_up == "1M":
+        p5 = pipe.load(symbol, "5M")
+        c5 = pipe.load(context_symbol, "5M")
+        if p5 is not None and not p5.empty:
+            htf_bars_map = {**(htf_bars_map or {}), "5M": p5}
+        if c5 is not None and not c5.empty:
+            htf_ctx_map = {**(htf_ctx_map or {}), "5M": {context_symbol: c5}}
+
+    eng = IntradayBiasEngine(IntradayBiasConfig(htf_bar_size=htf_up))
+    snap = eng.evaluate_bars(
+        ltf_bars=ltf_tail,
+        ltf_bar_size=bs_up,
+        context=ctx_map,
+        htf_bars=htf_bars_map,
+        htf_context=htf_ctx_map,
+    )
+    last_ts = pd.to_datetime(int(ltf_tail["time"].iloc[-1]), unit="ms", utc=True)
+    long_ok, long_al, long_why = snap.evaluate_trade_alignment(1, eng.config)
+    short_ok, short_al, short_why = snap.evaluate_trade_alignment(-1, eng.config)
+
+    table = Table(
+        title=f"Hybrid Intraday Bias + Scalper State — {symbol} ({htf_up} Bias -> {bs_up} Exec)",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("metric")
+    table.add_column("value")
+    table.add_column("detail")
+    table.add_row("last closed bar", str(last_ts), f"close={float(ltf_tail['close'].iloc[-1]):,.2f}")
+    table.add_row("intraday direction", snap.direction.value, f"composite bias={snap.bias_score:+.3f}")
+    table.add_row("market regime", snap.regime.value, f"roll_blackout={snap.roll_blackout}")
+    table.add_row(f"{htf_up} fair-value score", f"{snap.htf_fv_score:+.3f}", f"driver={context_symbol}")
+    table.add_row(f"{bs_up} scalper FV score", f"{snap.ltf_fv_score:+.3f}", "short-horizon dislocation")
+    table.add_row("session VWAP trend", f"{snap.session_trend:+.3f}", f"vwap_z={snap.session_vwap_z:+.2f}")
+    table.add_row("volatility regime", f"{snap.vol_regime_ratio:.2f}x", f"2H ER={snap.efficiency_ratio:.2f}")
+    table.add_row(
+        "LONG scalp gate",
+        "[green]ALLOW[/green]" if long_ok else "[red]VETO[/red]",
+        f"align={long_al:+.2f} | {long_why}",
+    )
+    table.add_row(
+        "SHORT scalp gate",
+        "[green]ALLOW[/green]" if short_ok else "[red]VETO[/red]",
+        f"align={short_al:+.2f} | {short_why}",
+    )
+    console.print(table)
 
 
 @app.command()

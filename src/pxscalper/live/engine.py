@@ -70,6 +70,9 @@ class LiveConfig:
     close_all_on_profit: float = 0.0     # 0 disables
     close_all_enforce: bool = False      # False = report only (paper observation)
     close_all_cooldown_s: float = 300.0  # re-arm delay after firing
+    # ---- synthetic L2 depth probing -----------------------------------------
+    l2_probe_interval_s: float = 0.0     # >0 probes /orders/market/impact ladder
+    l2_probe_ladder: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0)
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -87,6 +90,7 @@ class LiveEngine:
         feature_config: FeatureConfig | None = None,
         metrics: Metrics | None = None,
         clock=time.time,
+        quote_recorder=None,
     ) -> None:
         self.client = client
         self.predictor = predictor
@@ -98,10 +102,15 @@ class LiveEngine:
         self.metrics = metrics or Metrics()
         self.audit = JsonlLogger(config.log_path)
         self._clock = clock
+        self.quote_recorder = quote_recorder
 
         self.settings: dict[str, SymbolSettings] = {}
         self.buffers: dict[str, pd.DataFrame] = {}
+        self.context_buffers: dict[str, pd.DataFrame] = {}
+        self.htf_buffers: dict[tuple[str, str], pd.DataFrame] = {}
+        self.htf_context_buffers: dict[tuple[str, str], pd.DataFrame] = {}
         self._last_decision_time: dict[str, int] = {}
+        self._last_l2_probe: dict[str, float] = {}
         self._last_trade_s = 0.0
         self._last_loss_s = 0.0
         self._last_settings_refresh = 0.0
@@ -113,6 +122,55 @@ class LiveEngine:
         )
         self._consecutive_errors = 0
 
+    def _context_symbols(self) -> list[str]:
+        if getattr(self.features, "_context_cfg", None) is not None:
+            return list(self.features._context_cfg.symbols.keys())
+        return []
+
+    def _htf_context_symbols(self) -> list[str]:
+        syms = self._context_symbols()
+        if syms:
+            return syms
+        mtf_cfg = getattr(self.features, "_mtf_cfg", None)
+        if mtf_cfg is not None and getattr(mtf_cfg, "context_symbols", None):
+            return list(mtf_cfg.context_symbols.keys())
+        return []
+
+    def _htf_bar_sizes(self) -> list[str]:
+        mtf_cfg = getattr(self.features, "_mtf_cfg", None)
+        if mtf_cfg is None:
+            return []
+        ltf_ms = bar_ms(self.config.bar_size)
+        return [str(tf).upper() for tf in mtf_cfg.htf_bar_sizes if bar_ms(tf) > ltf_ms]
+
+    @staticmethod
+    def _closed_htf_slice(
+        frame: pd.DataFrame | None, htf_bar_size: str, ltf_close_ms: int
+    ) -> pd.DataFrame | None:
+        if frame is None or frame.empty:
+            return None
+        htf_ms = bar_ms(htf_bar_size)
+        closed = frame[frame["time"].astype(np.int64) + htf_ms <= ltf_close_ms]
+        return closed.reset_index(drop=True) if not closed.empty else None
+
+    def _load_symbol_history(self, symbol: str, target_bar_size: str | None = None, need_bars: int | None = None) -> pd.DataFrame:
+        bs = target_bar_size or self.config.bar_size
+        bars = self.client.bars(symbol, bs, limit=500)
+        if not bars:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+        collected = list(reversed(bars))
+        need = need_bars if need_bars is not None else self.config.warmup_bars
+        oldest = collected[0].time
+        while len(collected) < need:
+            chunk = self.client.bars(
+                symbol, bs, limit=500, end_ms=oldest - 1
+            )
+            if not chunk:
+                break
+            collected = chunk + collected
+            oldest = chunk[0].time
+        return _bars_to_frame(collected)
+
     # ---------------------------------------------------------------- lifecycle
     def prepare(self) -> None:
         """Load metadata, history and warm the model. Never trade before this."""
@@ -120,22 +178,23 @@ class LiveEngine:
         self.client.sync_clock()
         self._refresh_settings(force=True)
         for symbol in self.config.symbols:
-            bars = self.client.bars(symbol, self.config.bar_size, limit=500)
-            collected = list(reversed(bars))
-            need = self.config.warmup_bars
-            oldest = collected[0].time
-            while len(collected) < need:
-                chunk = self.client.bars(
-                    symbol, self.config.bar_size, limit=500, end_ms=oldest - 1
-                )
-                if not chunk:
-                    break
-                collected = chunk + collected
-                oldest = chunk[0].time
-            frame = _bars_to_frame(collected)
+            frame = self._load_symbol_history(symbol)
             self.buffers[symbol] = frame
-            log.info("%s: %d bars loaded (last %s)", symbol, len(frame),
-                     pd.to_datetime(frame["time"].iloc[-1], unit="ms", utc=True))
+            if len(frame):
+                log.info("%s: %d bars loaded (last %s)", symbol, len(frame),
+                         pd.to_datetime(frame["time"].iloc[-1], unit="ms", utc=True))
+            for htf_bs in self._htf_bar_sizes():
+                hframe = self._load_symbol_history(symbol, target_bar_size=htf_bs, need_bars=300)
+                self.htf_buffers[(symbol, htf_bs)] = hframe
+        for ctx_sym in self._context_symbols():
+            cframe = self._load_symbol_history(ctx_sym)
+            self.context_buffers[ctx_sym] = cframe
+            if len(cframe):
+                log.info("context %s: %d bars loaded", ctx_sym, len(cframe))
+        for ctx_sym in self._htf_context_symbols():
+            for htf_bs in self._htf_bar_sizes():
+                hcframe = self._load_symbol_history(ctx_sym, target_bar_size=htf_bs, need_bars=300)
+                self.htf_context_buffers[(ctx_sym, htf_bs)] = hcframe
         latency = self.predictor.warmup(100)
         self.metrics.set_inference_latency(latency)
         log.info("model warm; last inference %.0f us", latency)
@@ -241,6 +300,23 @@ class LiveEngine:
             log.warning("%s: no quote", symbol)
             return
         quote = quotes[0]
+        if self.quote_recorder is not None:
+            try:
+                book_snap = None
+                now_s = self._clock()
+                if (
+                    self.config.l2_probe_interval_s > 0
+                    and now_s - self._last_l2_probe.get(symbol, 0.0) >= self.config.l2_probe_interval_s
+                ):
+                    from ..exchange.orderbook import probe_synthetic_orderbook
+
+                    book_snap = probe_synthetic_orderbook(
+                        self.client, symbol, size_ladder=self.config.l2_probe_ladder, quote=quote
+                    )
+                    self._last_l2_probe[symbol] = now_s
+                self.quote_recorder.record_quote(quote, book=book_snap)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("quote_recorder failed: %s", exc)
         if not quote.market_open:
             log.info("%s: market closed", symbol)
             return
@@ -256,12 +332,94 @@ class LiveEngine:
         # ---- position management first: exits outrank entries --------------
         symbol_positions = [p for p in positions if p.symbol == symbol]
         atr = self._atr(symbol)
+        closed_any = False
         for pos in symbol_positions:
             if self._manage_position(pos, mid, atr, symbol):
-                return  # closed this bar; do not re-enter on the same bar
+                closed_any = True
+        if closed_any:
+            return  # closed at least one position this bar; do not re-enter on the same bar
+
+        # ---- refresh context buffers when cross-asset features are active --
+        for ctx_sym in self._context_symbols():
+            cfresh = self.client.bars(ctx_sym, self.config.bar_size, limit=2)
+            if cfresh:
+                cframe = _bars_to_frame(cfresh)
+                prev_ctx = self.context_buffers.get(ctx_sym)
+                merged_ctx = (
+                    pd.concat([prev_ctx, cframe], ignore_index=True)
+                    if prev_ctx is not None and not prev_ctx.empty
+                    else cframe
+                )
+                self.context_buffers[ctx_sym] = (
+                    merged_ctx.drop_duplicates("time", keep="last")
+                    .sort_values("time")
+                    .reset_index(drop=True)
+                    .tail(self.config.warmup_bars + 200)
+                )
+
+        # ---- refresh causal higher-timeframe buffers for Hybrid Intraday Bias
+        ltf_close_ms = int(self.buffers[symbol]["time"].iloc[-1]) + bar
+        htf_bars_arg: dict[str, pd.DataFrame] | None = None
+        htf_ctx_arg: dict[str, dict[str, pd.DataFrame]] | None = None
+        active_htfs = self._htf_bar_sizes()
+        if active_htfs:
+            htf_bars_arg = {}
+            htf_ctx_arg = {}
+            for htf_bs in active_htfs:
+                hfresh = self.client.bars(symbol, htf_bs, limit=2)
+                if hfresh:
+                    hframe = _bars_to_frame(hfresh)
+                    prev_h = self.htf_buffers.get((symbol, htf_bs))
+                    merged_h = (
+                        pd.concat([prev_h, hframe], ignore_index=True)
+                        if prev_h is not None and not prev_h.empty
+                        else hframe
+                    )
+                    self.htf_buffers[(symbol, htf_bs)] = (
+                        merged_h.drop_duplicates("time", keep="last")
+                        .sort_values("time")
+                        .reset_index(drop=True)
+                        .tail(400)
+                    )
+                closed_h = self._closed_htf_slice(
+                    self.htf_buffers.get((symbol, htf_bs)), htf_bs, ltf_close_ms
+                )
+                if closed_h is not None:
+                    htf_bars_arg[htf_bs] = closed_h
+
+                cmap_closed: dict[str, pd.DataFrame] = {}
+                for ctx_sym in self._htf_context_symbols():
+                    hcfresh = self.client.bars(ctx_sym, htf_bs, limit=2)
+                    if hcfresh:
+                        hcframe = _bars_to_frame(hcfresh)
+                        prev_hc = self.htf_context_buffers.get((ctx_sym, htf_bs))
+                        merged_hc = (
+                            pd.concat([prev_hc, hcframe], ignore_index=True)
+                            if prev_hc is not None and not prev_hc.empty
+                            else hcframe
+                        )
+                        self.htf_context_buffers[(ctx_sym, htf_bs)] = (
+                            merged_hc.drop_duplicates("time", keep="last")
+                            .sort_values("time")
+                            .reset_index(drop=True)
+                            .tail(400)
+                        )
+                    closed_hc = self._closed_htf_slice(
+                        self.htf_context_buffers.get((ctx_sym, htf_bs)), htf_bs, ltf_close_ms
+                    )
+                    if closed_hc is not None:
+                        cmap_closed[ctx_sym] = closed_hc
+                if cmap_closed:
+                    htf_ctx_arg[htf_bs] = cmap_closed
 
         # ---- features ------------------------------------------------------
-        window = self.features.last_window(self.buffers[symbol], self.config.lookback)
+        window = self.features.last_window(
+            self.buffers[symbol],
+            self.config.lookback,
+            context=self.context_buffers if self.context_buffers else None,
+            htf_bars=htf_bars_arg or None,
+            htf_context=htf_ctx_arg or None,
+        )
         if window is None:
             log.warning("%s: not enough history for a window yet", symbol)
             return
@@ -349,19 +507,45 @@ class LiveEngine:
             return
 
         # ---- execute -------------------------------------------------------
-        qty = verdict.qty * decision.size_multiplier
-        qty = settings.round_qty(qty)
+        qty = settings.floor_qty(verdict.qty * decision.size_multiplier)
         if qty < settings.min_qty:
             log.info("%s: scaled qty %.8f below min, skipping", symbol, qty)
             self.audit.write("no_trade", reason="qty below min after scaling", **record)
             return
+
+        # Enforce allow_hedging=False in HEDGE/NETTING accounts: close any
+        # opposite-side open positions before placing the new entry, fulfilling
+        # RiskEngine's "reverse handled by execution layer" contract.
+        if symbol_positions and not self.risk.config.allow_hedging:
+            want_buy = decision.intent.direction > 0
+            opposite_positions = [
+                p for p in symbol_positions
+                if (want_buy and p.side.upper() == "SELL")
+                or (not want_buy and p.side.upper() == "BUY")
+            ]
+            for opp in opposite_positions:
+                close_res = self.router.close_position(opp, reason="reverse before opposite entry")
+                self._after_close(opp, close_res)
+                if not close_res.ok:
+                    log.error(
+                        "%s: aborting reversal entry because closing opposite position %s failed: %s",
+                        symbol, opp.id, close_res.error,
+                    )
+                    self.audit.write("trade_failed", reason="opposite close failed", **record)
+                    return
+
+        tp_price = verdict.take_profit
+        tp_mult = float(decision.meta.get("tp_atr_mult", 1.0)) if decision.meta else 1.0
+        if tp_price is not None and abs(tp_mult - 1.0) > 1e-6 and atr > 0:
+            tp_dist = self.risk.config.tp_atr * tp_mult * atr
+            tp_price = settings.round_price(mid + decision.intent.direction * tp_dist)
 
         result = self.router.open_position(
             symbol=symbol,
             intent=decision.intent.value,
             qty=qty,
             stop_loss=verdict.stop_loss,
-            take_profit=verdict.take_profit,
+            take_profit=tp_price,
             reference_price=mid,
             bar_time_ms=int(self.buffers[symbol]["time"].iloc[-1]),
         )
@@ -385,7 +569,8 @@ class LiveEngine:
     def _manage_position(self, pos: Position, mid: float, atr: float, symbol: str) -> bool:
         """Return True when the position was closed or should be left alone."""
         cfg = self.config
-        held_bars = max(int((now_ms() - pos.open_time) / bar_ms(cfg.bar_size)), 0)
+        current_ms = int(self._clock() * 1000)
+        held_bars = max(int((current_ms - pos.open_time) / bar_ms(cfg.bar_size)), 0)
         side = 1 if pos.side == "BUY" else -1
         pnl_price = side * (mid - pos.open_price)
 
@@ -478,6 +663,7 @@ class LiveEngine:
             return
         rows = self.client.settings(symbols=self.config.symbols)
         self.settings = {s.symbol: s for s in rows}
+        self.router.settings.update(self.settings)
         self._last_settings_refresh = time.time()
         for symbol, s in self.settings.items():
             log.info(

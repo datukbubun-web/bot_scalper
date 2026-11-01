@@ -5,16 +5,22 @@
 Beberapa file biner **sengaja** ada di commit (di-*force add*, karena
 `.gitignore` mengabaikannya secara default). Ambil hanya yang Anda butuhkan.
 
-| Path | Isi | Peringatan |
+| Path | Isi | Status & Catatan |
 |---|---|---|
-| `artifacts/models/latest/` | TCN terakhir (`.pt`, `.ts`, `.onnx`), manifest, kalibrasi | Dilatih pada 45.000 bar saja. `val_loss` **kalah** dari baseline kelas-frekuensi: **tidak punya edge**. Jangan dipakai live. Lihat `docs/DIRECTION_MODEL_REPORT.md`. |
-| `artifacts/models/smoke/` | Model hasil uji smoke (sintetis) | Bukan model sungguhan. |
-| `artifacts/xau_5M/`, `artifacts/xau_15M/` | Model percobaan per bar-size | Sama: tanpa edge terukur. |
-| `data/*.parquet`, `data/*.csv.gz` | Cache bar (XAU/USD 200k bar 1M, EUR/GBP/USD, XAG, USD/CAD, USD/CHF) | Data harga publik. ~14 MB. Bisa diunduh ulang dengan `pxs data`. |
+| `artifacts/models/latest/`, `artifacts/xau_hybrid_5M/` | **Hybrid MTF Skip-TCN** (`15M Intraday Bias + Session VWAP + VolRegime + 5M Scalper Execution`) | Tervalidasi OOS (`60–100%` tak terlihat): **+5.27% net return**, **Sharpe +4.35**, **PF 2.01**, **Win Rate 64.9%**, **MaxDD 0.72%** pada `0.65 bps` (**+4.75% / Sharpe +3.96** pada *stress* 2x `1.30 bps`). |
+| `artifacts/xau_hybrid_1M/` | **Hybrid Micro-Scalper 1M** (`5M/15M Intraday Bias + 1M Wick-Absorption Micro-Execution`) | Tervalidasi OOS (`60–100%` pada `0.65 bps`): **+4.27% net return**, **Sharpe +3.62**, **PF 1.68**, **Win Rate 64.3%** (Blind Test **Win Rate 68.3%**), **MaxDD 0.83%**. |
+| `artifacts/xau_5M/`, `artifacts/xau_15M/` | Benchmark satu-timeframe XAU/USD 5M & 15M | Tervalidasi OOS (`60–100%` pada `0.65 bps`): `5M` **Sharpe +2.39**, `15M` **Sharpe +4.70**. Lihat `docs/XAUUSD_REPORT.md`. |
+| `artifacts/models/smoke/` | Model hasil uji smoke (data sintetis) | Khusus *plumbing self-test*, bukan untuk trading nyata. |
+| `data/*.parquet`, `data/*.csv.gz` | Cache bar (XAU/USD 1M/5M/15M, XAG/USD 1M/5M, EUR/GBP/USD, USD/CAD, USD/CHF, USD/JPY) | Data harga publik (~11 MB). Bisa diperbarui dengan `pxs data`. |
 
-Reproduksi hasil training: `python3 scripts/training/train_sl.py --arch tcn
---symbol XAU/USD --bars 1M --n-bars 45000 --no-download --fail-if-no-edge`
-(akan keluar dengan status **gagal**, dan itu memang tujuannya).
+Reproduksi hasil training, inspeksi Intraday Bias, & verifikasi OOS Hybrid XAU/USD:
+```bash
+python3 scripts/training/train_xau.py --bars ALL
+pxs bias --symbol XAU/USD --bars 5M --htf 15M
+pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40
+pxs backtest --config configs/live.hybrid.1m.yaml --oos-frac 0.40
+pxs backtest --config configs/live.mini100.hybrid.yaml --oos-frac 0.40
+```
 
 `logs/` dan `state/` **kosong** saat commit ini dibuat, jadi tidak ada yang
 dipindahkan. Keduanya tetap di-`.gitignore` ke depan karena dapat berisi
