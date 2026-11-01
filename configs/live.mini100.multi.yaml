@@ -6,15 +6,15 @@
 # (scaling in) pada XAU/USD, dengan target profit gabungan $3 yang menutup
 # semuanya sekaligus. Risikonya: 10 entry searah bisa kena stop bersamaan,
 # jadi kerugian totalnya sampai 10x satu stop. Karena itu max_total_loss_pct
-# 10% tetap menjadi batas keras.
+# 30% tetap menjadi batas keras permanen.
 #
 # Plafon eksposur total tetap mengikat: $100 x 1000% = $1.000 notional
 # untuk SELURUH posisi, bukan per posisi. Sepuluh posisi @ $100 = $1.000.
 
-symbols: ["XAU/USD"]           # TAMBAHKAN simbol lain, kalau tidak posisi 2-10 tak terpakai
+symbols: ["XAU/USD"]           # Satu instrumen XAU/USD (single_symbol: true); posisi 2-10 dipakai scaling-in searah
 bar_size: "5M"
 lookback: 64
-horizon: 5
+horizon: 12
 
 inference:
   backend: "onnx"
@@ -39,8 +39,8 @@ risk:
   split_exposure_across_slots: true  # $1.000 dibagi ke slot yang tersisa,
                                      # supaya 10 posisi benar-benar bisa dibuka
   max_leverage: 10.0
-  sl_atr: 1.0
-  tp_atr: 1.5
+  sl_atr: 4.5
+  tp_atr: 6.0
   max_holding_bars: 12
 
   # Rem intraday 20% (permintaan Anda). Batas lain diselaraskan supaya 20% itu
@@ -78,8 +78,8 @@ close_all_cooldown_s: 300     # jeda sebelum bisa memicu lagi setelah flat
 # ---- masuk bertahap (scaling in) di satu simbol -----------------------
 # Tidak ada saklar khusus: `max_positions_per_symbol` sudah mengizinkan sampai
 # 10 entry searah di XAU/USD. PERINGATAN: 10 entry searah bisa kena stop
-# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 2% dan
-# max_total_loss_pct 10% yang menahannya.
+# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 20% dan
+# max_total_loss_pct 30% yang menahannya.
 
 execution:
   order_type: "market"

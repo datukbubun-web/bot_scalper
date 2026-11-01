@@ -68,6 +68,10 @@ class FeatureConfig:
     clip_sigma: float = 8.0
     include_time_features: bool = True
     include_quote_features: bool = True
+    #: When historical bars lack ``bid``/``ask``, populate ``spread_bps``,
+    #: ``quote_imbalance`` and ``microprice_dev`` with causal OHLCV estimators
+    #: (Abdi-Ranaldo + Corwin-Schultz spread, BVC + wick imbalance).
+    synthetic_microstructure: bool = False
     #: Attach cross-asset context features (silver, dollar proxies). Requires the
     #: context bars to be passed to ``transform``; changes n_features, so it is
     #: recorded in the model manifest and must match at inference time.
@@ -78,6 +82,14 @@ class FeatureConfig:
     #: is never touched, so this is not look-ahead.
     include_calendar_features: bool = False
     calendar_config: dict = field(default_factory=dict)
+    #: Attach institutional Gold session/fixing interaction features (SGE AM
+    #: post-fix unwind, post-LBMA-AM / pre-COMEX inventory reversion, daily roll).
+    include_gold_session_features: bool = False
+    #: Attach causal multi-timeframe (HTF) Intraday Bias & Session Regime features
+    #: (T_htf + htf_ms <= t_ltf + ltf_ms). Used by the Hybrid Architecture.
+    include_mtf_bias_features: bool = False
+    mtf_bias_config: dict = field(default_factory=dict)
+    bar_size: str = ""
     #: Hours (UTC) of the London/NY overlap, where FX liquidity is deepest.
     session_windows: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
@@ -102,7 +114,8 @@ class FeatureConfig:
             raw["short_returns"] = tuple(raw["short_returns"])
         if "session_windows" in raw:
             raw["session_windows"] = {k: tuple(v) for k, v in raw["session_windows"].items()}
-        return cls(**raw)
+        valid = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
+        return cls(**valid)
 
 
 FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
@@ -161,9 +174,41 @@ class FeatureEngineer:
             self.calendar_names = ()
             self._calendar_cfg = None
 
-        suffix = ("+ctx" if self.context_names else "") + (
-            "+cal" if self.calendar_names else "")
+        if self.config.include_gold_session_features:
+            self.gold_session_names: tuple[str, ...] = (
+                "gold_ny12_rev",
+                "gold_sge02_unwind",
+                "gold_roll_blackout",
+            )
+            self.feature_names = tuple(self.feature_names) + self.gold_session_names
+        else:
+            self.gold_session_names = ()
+
+        if self.config.include_mtf_bias_features:
+            from .mtf import MTFBiasConfig, mtf_feature_names
+
+            self._mtf_cfg = MTFBiasConfig.from_dict(self.config.mtf_bias_config)
+            ctx_syms = (
+                self._context_cfg.symbols if self._context_cfg is not None else None
+            ) or self._mtf_cfg.context_symbols
+            self.mtf_names = mtf_feature_names(self._mtf_cfg, context_symbols=ctx_syms)
+            self.feature_names = tuple(self.feature_names) + self.mtf_names
+        else:
+            self.mtf_names = ()
+            self._mtf_cfg = None
+
+        suffix = (
+            ("+ctx" if self.context_names else "")
+            + ("+cal" if self.calendar_names else "")
+            + ("+synmicro" if self.config.synthetic_microstructure else "")
+            + ("+gold" if self.gold_session_features_active else "")
+            + ("+mtf" if self.mtf_names else "")
+        )
         self.version = f"{MODEL_FEATURE_VERSION}{suffix}"
+
+    @property
+    def gold_session_features_active(self) -> bool:
+        return bool(self.gold_session_names)
 
     # ------------------------------------------------------------------ public
     @property
@@ -171,7 +216,11 @@ class FeatureEngineer:
         return len(self.feature_names)
 
     def transform(
-        self, bars: pd.DataFrame, context: dict[str, pd.DataFrame] | None = None
+        self,
+        bars: pd.DataFrame,
+        context: dict[str, pd.DataFrame] | None = None,
+        htf_bars: dict[str, pd.DataFrame] | None = None,
+        htf_context: dict[str, dict[str, pd.DataFrame]] | None = None,
     ) -> pd.DataFrame:
         """Raw bars -> feature frame (un-normalised), index aligned to ``bars``.
 
@@ -192,8 +241,10 @@ class FeatureEngineer:
 
         # ---------------------------------------------------------- returns
         log_ret = np.log(close).diff()
+        vol_base = log_ret.rolling(cfg.vol_window, min_periods=max(2, cfg.vol_window // 2)).std()
         for w in cfg.short_returns:
-            out[f"ret_{w}"] = np.log(close).diff(w) / (log_ret.rolling(w).std() * np.sqrt(w) + 1e-12)
+            scale = log_ret.rolling(w).std() if w >= 3 else vol_base
+            out[f"ret_{w}"] = np.log(close).diff(w) / (scale * np.sqrt(w) + 1e-12)
 
         # --------------------------------------------------------- momentum
         ema_f = close.ewm(span=cfg.ema_fast, adjust=False).mean()
@@ -258,10 +309,23 @@ class FeatureEngineer:
                 (-log_ret * log_ret.shift(1)).rolling(cfg.ofi_window).mean().clip(lower=0)
             )
         else:
-            # honest fallback: no quote data -> neutral, not fake
-            out["spread_bps"] = np.nan
-            out["quote_imbalance"] = 0.0
-            out["microprice_dev"] = 0.0
+            if cfg.synthetic_microstructure:
+                from .microstructure import (
+                    bvc_order_imbalance,
+                    synthetic_microprice_dev_bps,
+                    synthetic_spread_bps,
+                )
+
+                out["spread_bps"] = synthetic_spread_bps(high, low, close, window=cfg.ofi_window)
+                out["quote_imbalance"] = bvc_order_imbalance(
+                    open_, high, low, close, volume, window=cfg.ofi_window
+                )
+                out["microprice_dev"] = synthetic_microprice_dev_bps(open_, high, low, close)
+            else:
+                # honest fallback: no quote data -> neutral, not fake
+                out["spread_bps"] = np.nan
+                out["quote_imbalance"] = 0.0
+                out["microprice_dev"] = 0.0
             out["roll_measure"] = np.sqrt(
                 (-log_ret * log_ret.shift(1)).rolling(cfg.ofi_window).mean().clip(lower=0)
             )
@@ -308,6 +372,51 @@ class FeatureEngineer:
             cal.index = out.index
             out = out.join(cal)
 
+        # ------------------------------------ gold session interactions
+        if getattr(self, "gold_session_names", ()):
+            ts_g = pd.to_datetime(df["time"], unit="ms", utc=True)
+            tod = ts_g.dt.hour * 60 + ts_g.dt.minute
+            bar_min = int(max(1, round(float(df["time"].diff().median() or 300_000) / 60_000.0)))
+            bars_2h = max(1, int(round(120 / bar_min)))
+            rvol_g = log_ret.rolling(max(24, bars_2h * 6), min_periods=10).std().replace(0.0, np.nan)
+            mv_2h = (np.log(close).diff(bars_2h) / (rvol_g * np.sqrt(bars_2h))).clip(-3.5, 3.5).fillna(0.0)
+            # Trigger on the bar closing at 12:00 UTC (pre-COMEX / post-LBMA-AM inventory fade)
+            out["gold_ny12_rev"] = np.where(tod == 12 * 60 - bar_min, -mv_2h, 0.0)
+            # Trigger on the bar closing at 02:00 UTC (post-SGE AM Benchmark unwind)
+            out["gold_sge02_unwind"] = np.where(tod == 2 * 60 - bar_min, -1.0, 0.0)
+            # Daily COMEX/CFD maintenance roll window (21:00 - 22:59 UTC)
+            out["gold_roll_blackout"] = ((ts_g.dt.hour >= 21) & (ts_g.dt.hour < 23)).astype(float)
+
+        # ------------------------------ multi-timeframe intraday bias & regime
+        if getattr(self, "mtf_names", ()) and self._mtf_cfg is not None:
+            from .mtf import compute_mtf_bias_features
+
+            ltf_bs = cfg.bar_size
+            if not ltf_bs:
+                dt_med = int(max(60_000, round(float(df["time"].diff().median() or 60_000))))
+                if dt_med >= 3_600_000:
+                    ltf_bs = "1H"
+                elif dt_med >= 900_000:
+                    ltf_bs = "15M"
+                elif dt_med >= 300_000:
+                    ltf_bs = "5M"
+                else:
+                    ltf_bs = "1M"
+            ctx_syms = (
+                self._context_cfg.symbols if self._context_cfg is not None else None
+            ) or self._mtf_cfg.context_symbols
+            mtf_df = compute_mtf_bias_features(
+                ltf_bars=df,
+                ltf_bar_size=ltf_bs,
+                cfg=self._mtf_cfg,
+                context_symbols=ctx_syms,
+                ltf_context=context,
+                htf_bars_by_tf=htf_bars,
+                htf_context_by_tf=htf_context,
+            )
+            mtf_df.index = out.index
+            out = out.join(mtf_df)
+
         out = out.reindex(columns=list(self.feature_names))
         return out.replace([np.inf, -np.inf], np.nan)
 
@@ -320,6 +429,10 @@ class FeatureEngineer:
             if (
                 col.startswith("sess_")
                 or col.startswith("cal_")     # see below
+                or col.startswith("gold_")
+                or col.startswith("htf_")
+                or col.startswith("intraday_")
+                or (col.startswith("ctx_") and "_rv_z_" in col)
                 or col in {
                     "hour_sin", "hour_cos", "minute_sin", "minute_cos", "dow_sin", "dow_cos",
                 }
@@ -342,9 +455,15 @@ class FeatureEngineer:
         return normalized.fillna(0.0)
 
     def transform_normalized(
-        self, bars: pd.DataFrame, context: dict[str, pd.DataFrame] | None = None
+        self,
+        bars: pd.DataFrame,
+        context: dict[str, pd.DataFrame] | None = None,
+        htf_bars: dict[str, pd.DataFrame] | None = None,
+        htf_context: dict[str, dict[str, pd.DataFrame]] | None = None,
     ) -> pd.DataFrame:
-        return self.normalize(self.transform(bars, context=context))
+        return self.normalize(
+            self.transform(bars, context=context, htf_bars=htf_bars, htf_context=htf_context)
+        )
 
     def make_windows(
         self, normalized: pd.DataFrame, lookback: int, drop_warmup: bool = True
@@ -354,18 +473,23 @@ class FeatureEngineer:
         n = len(values)
         if n < lookback:
             return np.empty((0, values.shape[1], lookback), np.float32), np.empty((0,), dtype=np.int64)
-        starts = np.arange(0, n - lookback + 1)
-        windows = np.stack([values[s : s + lookback] for s in starts])  # (N, L, C)
-        windows = np.transpose(windows, (0, 2, 1)).astype(np.float32)
-        last_ts = (starts + lookback - 1).astype(np.int64)  # positional bar index
+        windows = np.lib.stride_tricks.sliding_window_view(values, window_shape=lookback, axis=0)
+        last_ts = np.arange(lookback - 1, n, dtype=np.int64)  # positional bar index
         if drop_warmup:
             # rows before warmup are filled with zeros by normalize(); drop them
             warmup = min(self.config.norm_min_periods + max(self.config.atr_window, self.config.regime_window), n)
-            keep = starts + lookback - 1 >= warmup
+            keep = last_ts >= warmup
             windows, last_ts = windows[keep], last_ts[keep]
-        return windows, last_ts
+        return np.ascontiguousarray(windows, dtype=np.float32), last_ts
 
-    def last_window(self, bars: pd.DataFrame, lookback: int) -> np.ndarray | None:
+    def last_window(
+        self,
+        bars: pd.DataFrame,
+        lookback: int,
+        context: dict[str, pd.DataFrame] | None = None,
+        htf_bars: dict[str, pd.DataFrame] | None = None,
+        htf_context: dict[str, dict[str, pd.DataFrame]] | None = None,
+    ) -> np.ndarray | None:
         """(1, C, L) window for the newest bar -- the live inference path.
 
         The tail must be long enough that the causal rolling normalisation is
@@ -373,7 +497,17 @@ class FeatureEngineer:
         slightly different inputs live than in the backtest (train/serve skew).
         """
         buffer = lookback + self.config.norm_window + 700
-        normalized = self.transform_normalized(bars.tail(buffer))
+        ctx_tail = (
+            {k: v.tail(buffer + 200) for k, v in context.items() if v is not None}
+            if context
+            else None
+        )
+        normalized = self.transform_normalized(
+            bars.tail(buffer),
+            context=ctx_tail,
+            htf_bars=htf_bars,
+            htf_context=htf_context,
+        )
         if len(normalized) < lookback:
             return None
         values = normalized.to_numpy(dtype=np.float32)[-lookback:]

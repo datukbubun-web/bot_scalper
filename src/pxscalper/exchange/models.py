@@ -136,9 +136,26 @@ class SymbolSettings:
 
     def round_qty(self, qty: float) -> float:
         if self.qty_step <= 0:
-            return max(qty, self.min_qty)
+            return min(max(qty, self.min_qty), self.max_qty)
         steps = round(qty / self.qty_step)
-        return round(max(steps * self.qty_step, self.min_qty), 10)
+        return round(min(max(steps * self.qty_step, self.min_qty), self.max_qty), 10)
+
+    def floor_qty(self, qty: float) -> float:
+        """Floor ``qty`` to ``qty_step`` without ever exceeding ``qty`` or rounding up to ``min_qty``.
+
+        Returns ``0.0`` when ``qty < min_qty`` so risk-capped position sizing can
+        cleanly reject sub-minimum orders instead of silently multiplying risk.
+        """
+        if qty <= 0 or qty + 1e-12 < self.min_qty:
+            return 0.0
+        capped = min(qty, self.max_qty)
+        if self.qty_step <= 0:
+            return round(capped, 10) if capped + 1e-12 >= self.min_qty else 0.0
+        import math
+
+        steps = math.floor((capped + 1e-12) / self.qty_step)
+        floored = round(steps * self.qty_step, 10)
+        return floored if floored + 1e-12 >= self.min_qty else 0.0
 
     def round_price(self, price: float) -> float:
         if self.min_price_step <= 0:

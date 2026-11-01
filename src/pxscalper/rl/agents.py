@@ -268,9 +268,9 @@ class PPOAgent:
                 with torch.no_grad():
                     approx_kl = float(((ratio - 1) - (log_probs - old_log_probs[idx])).mean())
                     clipfrac = float(((ratio - 1).abs() > cfg.clip_ratio).float().mean())
-                stats["policy_loss"] += float(policy_loss)
-                stats["value_loss"] += float(value_loss)
-                stats["entropy"] += float(entropy)
+                stats["policy_loss"] += float(policy_loss.detach())
+                stats["value_loss"] += float(value_loss.detach())
+                stats["entropy"] += float(entropy.detach())
                 stats["approx_kl"] += approx_kl
                 stats["clipfrac"] += clipfrac
                 iters += 1

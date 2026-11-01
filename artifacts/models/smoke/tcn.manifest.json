@@ -1,7 +1,7 @@
 {
   "arch": "tcn",
-  "torchscript_path": "/home/user/pxscalper/artifacts/models/smoke/tcn.ts",
-  "onnx_path": "/home/user/pxscalper/artifacts/models/smoke/tcn.onnx",
+  "torchscript_path": "tcn.ts",
+  "onnx_path": "tcn.onnx",
   "model_config": {
     "n_features": 38,
     "lookback": 64,
@@ -24,32 +24,43 @@
     "n_layers": 2,
     "ff_mult": 2,
     "head_hidden": 64,
-    "use_layer_norm": true
+    "use_layer_norm": true,
+    "use_skip": false,
+    "antisymmetric_head": false,
+    "roll_gate_channel": -1,
+    "agree_ltf_channel": -1,
+    "agree_htf_channel": -1,
+    "vol_gate_channel": -1,
+    "max_vol_excess": 0.85,
+    "trend_guard_channel": -1,
+    "max_opposing_trend": 0.6,
+    "wick_confirm_channel": -1,
+    "min_wick_confirm": 0.05
   },
   "latency_us": {
     "pytorch_eager": {
-      "mean_us": 1194.1431866666667,
-      "p50_us": 1176.9679999999998,
-      "p90_us": 1249.5904,
-      "p99_us": 1559.1547399999988,
-      "max_us": 2067.361
+      "mean_us": 997.2690966666667,
+      "p50_us": 989.231,
+      "p90_us": 1074.6601,
+      "p99_us": 1264.76084,
+      "max_us": 1417.476
     },
     "torchscript": {
-      "mean_us": 918.9478833333333,
-      "p50_us": 914.37,
-      "p90_us": 975.2975,
-      "p99_us": 1123.3542699999996,
-      "max_us": 1202.182
+      "mean_us": 782.3698166666667,
+      "p50_us": 784.794,
+      "p90_us": 838.4215,
+      "p99_us": 889.9778299999999,
+      "max_us": 1019.103
     },
     "onnxruntime": {
-      "mean_us": 257.1239166666667,
-      "p50_us": 243.735,
-      "p90_us": 299.36310000000003,
-      "p99_us": 428.08867999999956,
-      "max_us": 513.306
+      "mean_us": 210.40070666666668,
+      "p50_us": 200.59949999999998,
+      "p90_us": 243.93640000000005,
+      "p99_us": 276.8887099999999,
+      "max_us": 318.941
     },
     "_summary": {
-      "p99_speedup_onnx_vs_eager": 3.64,
+      "p99_speedup_onnx_vs_eager": 4.57,
       "iterations": 300,
       "on_cpu_threads": 2
     }

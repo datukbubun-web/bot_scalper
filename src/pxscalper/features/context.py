@@ -62,6 +62,14 @@ class ContextConfig:
     zscore_window: int = 120
     #: minimum fraction of non-NaN context bars required to keep a symbol
     min_coverage: float = 0.5
+    #: include causal beta-adjusted relative-value dislocation z-scores (rv_z_*)
+    include_rv_features: bool = False
+    rv_windows: tuple[int, ...] = (2, 4, 8)
+    rv_norm_window: int = 144
+
+    def __post_init__(self) -> None:
+        self.windows = tuple(self.windows)
+        self.rv_windows = tuple(self.rv_windows)
 
 
 def align_context(
@@ -149,6 +157,25 @@ def context_features(
             target_ret.rolling(w).corr(ctx_ret.shift(1))
         ).to_numpy()
 
+        if cfg.include_rv_features:
+            # Causal rolling OLS hedge ratio shifted by 1 bar so current-bar
+            # liquidity shocks do not contaminate the fair-value slope or scale.
+            rw = cfg.rv_norm_window
+            zw = max(cfg.zscore_window, rw)
+            m_t = target_ret.rolling(rw).mean()
+            m_c = ctx_ret.rolling(rw).mean()
+            c_tc = ((target_ret - m_t) * (ctx_ret - m_c)).rolling(rw).mean()
+            v_c = ((ctx_ret - m_c) ** 2).rolling(rw).mean()
+            beta_lag = (c_tc / v_c.replace(0.0, np.nan)).clip(0.05, 2.5).shift(1).bfill().fillna(0.55)
+            spread_ret_1 = target_ret - beta_lag * ctx_ret
+            sd_1 = spread_ret_1.rolling(zw, min_periods=max(20, rw // 3)).std().shift(1).replace(0.0, np.nan)
+            log_tgt = np.log(aligned["close"])
+            log_ctx = np.log(series)
+            for k in cfg.rv_windows:
+                misp = log_tgt.diff(k) - beta_lag * log_ctx.diff(k)
+                denom = sd_1 * np.sqrt(float(k))
+                out[f"ctx_{label}_rv_z_{k}"] = (misp / denom).clip(-5.0, 5.0).fillna(0.0).to_numpy()
+
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
 
@@ -165,10 +192,13 @@ def context_feature_names(config: ContextConfig | None = None) -> tuple[str, ...
     makes the training and inference column order identical.
     """
     cfg = config or ContextConfig()
+    suffixes = list(PER_SYMBOL_SUFFIXES)
+    if cfg.include_rv_features:
+        suffixes.extend(f"rv_z_{k}" for k in cfg.rv_windows)
     return tuple(
         f"ctx_{label}_{suffix}"
         for label in cfg.symbols.values()
-        for suffix in PER_SYMBOL_SUFFIXES
+        for suffix in suffixes
     )
 
 

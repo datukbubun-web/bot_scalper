@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  pxscalper -- Akun Mini $100 Arsitektur Hybrid (XAU/USD, 0.01 oz, safety-first):
+#  Layer 1: Intraday Bias (15M Cross-Metal Fair-Value + Session VWAP + VolRegime)
+#  Layer 2: Scalper Execution (5M ONNX Skip-TCN + Safety-First $100 Guardrails)
+# ─────────────────────────────────────────────────────────────────────────────
+
+symbols: ["XAU/USD"]
+bar_size: "5M"
+lookback: 64
+horizon: 12
+
+inference:
+  backend: "onnx"
+  model_dir: "artifacts/xau_hybrid_5M"
+  confidence_threshold: 0.45
+  edge_threshold: 0.03
+
+strategy:
+  kind: "hybrid"
+  min_confidence: 0.45
+  min_edge: 0.03
+  allow_flat: true
+  size_by_edge: false
+
+hybrid:
+  enabled: true
+  require_composite_threshold: true
+  composite_threshold: 1.85
+  require_micro_absorption: false
+  modulate_size_by_bias: false
+  bias:
+    htf_bar_size: "15M"
+    htf_rv_col: "htf_15m_xag_rv_z_2"
+    ltf_rv_col: "ctx_xag_rv_z_4"
+    ltf_weight: 0.65
+    htf_weight: 0.35
+    max_opposing_session_trend: 0.60
+    max_vol_regime_ratio: 1.85
+    min_vol_regime_ratio: 0.15
+    require_htf_non_opposing: true
+
+risk:
+  single_symbol: true
+  allowed_symbols: ["XAU/USD"]
+  risk_per_trade_pct: 0.5
+  max_leverage: 10.0
+  max_positions: 10
+  max_positions_per_symbol: 10
+  max_gross_exposure_pct: 1000.0
+  split_exposure_across_slots: true
+  sl_atr: 4.5
+  tp_atr: 6.0
+  max_holding_bars: 12
+  max_intraday_loss_pct: 20.0
+  max_daily_loss_pct: 25.0
+  max_total_loss_pct: 30.0
+  max_drawdown_pct: 28.0
+  max_daily_trades: 8
+  consecutive_loss_cooldown: 3
+  cooldown_minutes: 60
+  min_equity: 60.0
+  blackout_enabled: true
+  blackout_pre_min: 15
+  blackout_post_min: 15
+  blackout_kinds: ["nfp", "cpi", "fomc"]
+  max_spread_bps: 1.5
+  min_atr_bps: 1.5
+  max_atr_bps: 15.0
+  min_confidence: 0.45
+  min_edge: 0.03
+  max_daily_loss_stop: true
+  allow_hedging: false
+
+close_all_on_profit: 3.0
+close_all_enforce: true
+close_all_cooldown_s: 300
+
+execution:
+  order_type: "market"
+  max_slippage_bps: 3.0
+  reconcile_interval_s: 30
+  dry_run: true
+
+backtest:
+  align_to_context_span: true
+
+monitoring:
+  log_dir: "logs"
+  journal_path: "state/trades.jsonl"
+  heartbeat_s: 30

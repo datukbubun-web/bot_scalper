@@ -16,7 +16,7 @@
 symbols: ["XAU/USD"]
 bar_size: "5M"
 lookback: 64
-horizon: 5
+horizon: 12
 
 inference:
   backend: "onnx"
@@ -24,11 +24,26 @@ inference:
   edge_threshold: 0.03
 
 strategy:
-  kind: "probabilistic"
+  kind: "hybrid"
   min_confidence: 0.45
   min_edge: 0.03
   allow_flat: true
   size_by_edge: false
+
+hybrid:
+  enabled: true
+  require_composite_threshold: true
+  composite_threshold: 1.85
+  bias:
+    htf_bar_size: "15M"
+    htf_rv_col: "htf_15m_xag_rv_z_2"
+    ltf_rv_col: "ctx_xag_rv_z_4"
+    ltf_weight: 0.65
+    htf_weight: 0.35
+    max_opposing_session_trend: 0.60
+    max_vol_regime_ratio: 1.85
+    min_vol_regime_ratio: 0.15
+    require_htf_non_opposing: true
 
 risk:
   # ---- scope: satu instrumen saja --------------------------------------
@@ -45,8 +60,8 @@ risk:
   max_gross_exposure_pct: 1000.0 # konsisten dengan max_leverage
   split_exposure_across_slots: true  # $1.000 dibagi ke slot tersisa,
                                      # supaya 10 posisi benar-benar bisa dibuka
-  sl_atr: 1.0
-  tp_atr: 1.5
+  sl_atr: 4.5
+  tp_atr: 6.0
   max_holding_bars: 12
 
   # ---- guards: ini yang sesungguhnya melindungi $100 --------------------
@@ -89,8 +104,8 @@ close_all_cooldown_s: 300     # jeda sebelum bisa memicu lagi setelah flat
 # ---- masuk bertahap (scaling in) di satu simbol -----------------------
 # Tidak ada saklar khusus: `max_positions_per_symbol` sudah mengizinkan sampai
 # 10 entry searah di XAU/USD. PERINGATAN: 10 entry searah bisa kena stop
-# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 2% dan
-# max_total_loss_pct 10% yang menahannya.
+# bersamaan -> kerugian total sampai 10x satu stop. Rem intraday 20% dan
+# max_total_loss_pct 30% yang menahannya.
 
 execution:
   order_type: "market"

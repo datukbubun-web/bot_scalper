@@ -54,6 +54,17 @@ class ExecutionConfig:
     dry_run: bool = False
     retry_after_timeout: bool = False     # keep False unless you enjoy double fills
 
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None, **overrides: Any) -> "ExecutionConfig":
+        d = dict(raw or {})
+        if "order_type" in d and "use_limit_orders" not in d:
+            d["use_limit_orders"] = str(d["order_type"]).strip().upper() == "LIMIT"
+        if "max_slippage_bps" in d and "max_impact_vwap_bps" not in d:
+            d["max_impact_vwap_bps"] = float(d["max_slippage_bps"])
+        d.update(overrides)
+        valid = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        return cls(**valid)
+
 
 @dataclass
 class ExecutionResult:
@@ -103,13 +114,33 @@ class OrderRouter:
         started = time.perf_counter()
         side = "BUY" if intent.upper() in ("LONG", "BUY") else "SELL"
         settings = self.settings.get(symbol)
+        if qty <= 0 or (settings and qty + 1e-12 < settings.min_qty):
+            return self._fail(
+                intent, symbol, qty, reference_price,
+                f"qty {qty} below minimum {settings.min_qty if settings else 0.0}",
+                started,
+            )
         qty = settings.round_qty(qty) if settings else qty
         cid = make_client_order_id(symbol, bar_time_ms or int(time.time() * 1000), intent)
 
-        if stop_loss and settings:
+        if stop_loss is not None and stop_loss > 0 and settings:
             stop_loss = settings.round_price(stop_loss)
-        if take_profit and settings:
+        if take_profit is not None and take_profit > 0 and settings:
             take_profit = settings.round_price(take_profit)
+
+        # Snapshot pre-existing positions so post-trade verification detects
+        # the NEW fill (in HEDGE mode) or increased size (in NETTING mode),
+        # rather than falsely matching position #1 on scaled entries #2..#10.
+        pre_ids: set[int | str] = set()
+        pre_side_qty = 0.0
+        if not self.config.dry_run and self.config.verify_fills and self.config.verify_timeout_s > 0:
+            try:
+                existing = [p for p in self.client.positions() if p.symbol == symbol]
+                pre_ids = {p.id for p in existing}
+                pre_side_qty = sum(p.qty for p in existing if p.side.upper() == side)
+            except Exception:  # noqa: BLE001
+                pre_ids = set()
+                pre_side_qty = 0.0
 
         # ---- 1. cost it before sending it --------------------------------
         try:
@@ -189,14 +220,20 @@ class OrderRouter:
 
         # ---- 3. verify ----------------------------------------------------
         if self.config.verify_fills and self.config.verify_timeout_s > 0:
-            pos = self.wait_for_position(symbol, timeout_s=self.config.verify_timeout_s)
+            pos = self.wait_for_position(
+                symbol,
+                timeout_s=self.config.verify_timeout_s,
+                exclude_ids=pre_ids,
+                side=side,
+                min_side_qty=pre_side_qty,
+            )
             if pos is None:
                 result.ok = False
                 result.error = "order accepted but no position appeared (unfilled or rejected)"
                 log.error("%s", result.error)
             else:
                 result.price = pos.open_price
-                result.qty = pos.qty
+                result.qty = pos.qty - pre_side_qty if pos.id in pre_ids and pos.qty > pre_side_qty else pos.qty
         return result
 
     def close_position(self, position: Position, reason: str = "") -> ExecutionResult:
@@ -233,14 +270,29 @@ class OrderRouter:
             return False
 
     def wait_for_position(
-        self, symbol: str, timeout_s: float = 3.0, poll_s: float = 0.25
+        self,
+        symbol: str,
+        timeout_s: float = 3.0,
+        poll_s: float = 0.25,
+        exclude_ids: set[int | str] | None = None,
+        side: str | None = None,
+        min_side_qty: float = 0.0,
     ) -> Position | None:
+        excluded = exclude_ids or set()
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
-                for pos in self.client.positions():
-                    if pos.symbol == symbol:
+                same_sym = [p for p in self.client.positions() if p.symbol == symbol]
+                # 1. HEDGE / fresh entry: brand-new position ID matching side
+                for pos in same_sym:
+                    if pos.id not in excluded and (side is None or pos.side.upper() == side.upper()):
                         return pos
+                # 2. NETTING entry: existing same-side position whose qty increased
+                if excluded and side is not None:
+                    side_positions = [p for p in same_sym if p.side.upper() == side.upper()]
+                    total_side_qty = sum(p.qty for p in side_positions)
+                    if side_positions and total_side_qty > min_side_qty + 1e-12:
+                        return side_positions[-1]
             except ApiError as exc:
                 log.warning("positions poll failed: %s", exc)
             time.sleep(poll_s)

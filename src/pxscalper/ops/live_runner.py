@@ -23,6 +23,7 @@ from ..live.metrics import Metrics
 from ..live.reconcile import Reconciler
 from ..risk.engine import RiskConfig, RiskEngine, RiskState
 from ..strategy.decision import ScalpingStrategy, StrategyConfig
+from ..strategy.hybrid import HybridConfig, HybridStrategy
 from ..utils import RepoPaths
 
 log = logging.getLogger(__name__)
@@ -57,11 +58,11 @@ def build_engine(
     )
 
     client = PrimeXBTClient(credentials=creds, read_credentials=read_creds)
-    offset = client.sync_clock()
-    log.info("clock offset %+.0f ms", offset)
 
     # --------------------------------------------------------------- config
     live_raw = raw.get("live", {})
+    risk_raw = raw.get("risk", {})
+    data_raw = raw.get("data", {})
     # The examples (and every preset we ship) put `symbols` at the TOP level, but
     # this read from `raw["live"]["symbols"]` -- so every preset silently fell
     # back to its default of EUR/USD. Configuring the bot with a preset traded a
@@ -73,14 +74,22 @@ def build_engine(
             "no symbols configured: set top-level `symbols: [\"XAU/USD\"]` "
             "or `live.symbols`"
         )
+    bar_size_val = live_raw.get("bar_size", raw.get("bar_size", data_raw.get("bar_size", "1M")))
+    lookback_val = int(live_raw.get("lookback", raw.get("lookback", 64)))
+    max_hold_val = int(
+        live_raw.get(
+            "max_hold_bars",
+            raw.get("max_hold_bars", risk_raw.get("max_holding_bars", 45)),
+        )
+    )
     live_cfg = LiveConfig(
         symbols=list(symbols_raw),
-        bar_size=live_raw.get("bar_size", "1M"),
-        lookback=int(live_raw.get("lookback", 64)),
-        warmup_bars=int(live_raw.get("warmup_bars", 900)),
+        bar_size=str(bar_size_val),
+        lookback=lookback_val,
+        warmup_bars=int(live_raw.get("warmup_bars", raw.get("warmup_bars", 900))),
         settle_ms=int(live_raw.get("settle_ms", 1200)),
         loop_sleep_s=float(live_raw.get("loop_sleep_s", 2.5)),
-        max_hold_bars=int(live_raw.get("max_hold_bars", 45)),
+        max_hold_bars=max_hold_val,
         trailing_stop_atr=float(live_raw.get("trailing_stop_atr", 0.0)),
         close_all_on_profit=float(
             live_raw.get("close_all_on_profit", raw.get("close_all_on_profit", 0.0))
@@ -91,10 +100,19 @@ def build_engine(
         close_all_cooldown_s=float(
             live_raw.get("close_all_cooldown_s", raw.get("close_all_cooldown_s", 300.0))
         ),
+        l2_probe_interval_s=float(
+            live_raw.get("l2_probe_interval_s", raw.get("l2_probe_interval_s", 60.0))
+        ),
+        l2_probe_ladder=tuple(
+            float(x)
+            for x in live_raw.get(
+                "l2_probe_ladder", raw.get("l2_probe_ladder", (0.01, 0.1, 1.0, 10.0))
+            )
+        ),
         paper=not allow_live,
         log_path=str(paths.logs / "decisions.jsonl"),
     )
-    risk_cfg = RiskConfig.from_dict(raw.get("risk", {}))
+    risk_cfg = RiskConfig.from_dict(risk_raw)
     symbols = list(live_cfg.symbols)
 
     # ---- instrument scope -------------------------------------------------
@@ -122,25 +140,33 @@ def build_engine(
                 f"live.symbols contains {outside}, which risk.allowed_symbols "
                 f"{risk_cfg.allowed_symbols} forbids"
             )
-    exec_cfg = ExecutionConfig(
-        dry_run=not allow_live,
-        **{k: v for k, v in raw.get("execution", {}).items()
-           if k in ExecutionConfig.__dataclass_fields__ and k != "dry_run"},
-    )
+    exec_cfg = ExecutionConfig.from_dict(raw.get("execution", {}), dry_run=not allow_live)
+    strat_raw = dict(raw.get("strategy", {}))
+    if "require_rl_agreement" not in strat_raw:
+        strat_raw["require_rl_agreement"] = False
     strat_cfg = StrategyConfig(
-        **{k: v for k, v in raw.get("strategy", {}).items()
+        **{k: v for k, v in strat_raw.items()
            if k in StrategyConfig.__dataclass_fields__}
     )
 
     # --------------------------------------------------------------- models
     inf_raw = raw.get("inference", {})
     arch = inf_raw.get("arch", "tcn")
-    model_dir = paths.artifacts / "models" / inf_raw.get("version", "latest")
+    version = inf_raw.get("version", "latest")
+    if inf_raw.get("model_dir"):
+        model_dir = Path(inf_raw["model_dir"])
+    elif (paths.artifacts / "models" / version).exists():
+        model_dir = paths.artifacts / "models" / version
+    elif (paths.artifacts / version).exists():
+        model_dir = paths.artifacts / version
+    else:
+        model_dir = paths.artifacts / "models" / version
     manifest = model_dir / f"{arch}.manifest.json"
     if not manifest.exists():
         raise FileNotFoundError(
             f"{manifest} missing. Run `make train-{arch}` then `make export` first."
         )
+    expected_sym = symbols[0] if len(symbols) == 1 else None
     predictors = []
     for i in range(int(inf_raw.get("ensemble_size", 1)) or 1):
         cfg = PredictorConfig.from_manifest(
@@ -149,6 +175,7 @@ def build_engine(
             calibration_path=str(model_dir / "calibration.json")
             if (model_dir / "calibration.json").exists()
             else None,
+            expected_symbol=expected_sym,
             confidence_threshold=float(inf_raw.get("confidence_threshold", 0.45)),
             edge_threshold=float(inf_raw.get("edge_threshold", 0.0)),
             intra_op_threads=int(inf_raw.get("threads", 1)),
@@ -156,6 +183,14 @@ def build_engine(
         )
         predictors.append(Predictor(cfg))
     primary = predictors[0]
+    live_cfg.lookback = int(primary.config.lookback)
+
+    feat_json = model_dir / "features.json"
+    feat_cfg = FeatureConfig.load(feat_json) if feat_json.exists() else FeatureConfig()
+
+    # Sync clock & reconcile only AFTER local config/model validation succeeds
+    offset = client.sync_clock()
+    log.info("clock offset %+.0f ms", offset)
 
     # ----------------------------------------------------------------- risk
     risk = RiskEngine(risk_cfg, RiskState.load(risk_cfg.state_path))
@@ -166,9 +201,26 @@ def build_engine(
         log.warning("reconcile reported issues: %s", report.errors)
 
     # -------------------------------------------------------------- assembly
-    strategy = ScalpingStrategy(predictor=primary, config=strat_cfg)
+    from ..exchange.orderbook import QuoteBookRecorder
+    from ..features.pipeline import FeatureEngineer
+
+    hybrid_raw = raw.get("hybrid", {})
+    use_hybrid = (
+        str(strat_raw.get("kind", "")).lower() == "hybrid"
+        or bool(hybrid_raw.get("enabled", False))
+    )
+    if use_hybrid:
+        strategy = HybridStrategy(
+            predictor=primary,
+            config=strat_cfg,
+            hybrid_config=HybridConfig.from_dict(hybrid_raw),
+            feature_names=FeatureEngineer(feat_cfg).feature_names,
+        )
+    else:
+        strategy = ScalpingStrategy(predictor=primary, config=strat_cfg)
     router = OrderRouter(client, exec_cfg)
     metrics = Metrics(port=int(os.getenv("PX_METRICS_PORT", "9101")), enable_server=allow_live)
+    recorder = QuoteBookRecorder(paths.data / "quotes")
     engine = LiveEngine(
         client=client,
         predictor=primary,
@@ -176,8 +228,9 @@ def build_engine(
         router=router,
         strategy=strategy,
         config=live_cfg,
-        feature_config=FeatureConfig(),
+        feature_config=feat_cfg,
         metrics=metrics,
+        quote_recorder=recorder,
     )
     log.info(
         "engine assembled | symbols=%s | paper=%s | backend=%s | arch=%s",

@@ -1,8 +1,14 @@
 {
-  "temperature": 1.8886086916053075,
-  "nll_before": 1.0977452993392944,
-  "nll_after": 1.0947506773869689,
-  "n_samples": 2976,
+  "temperature": 1.0499957737235348,
+  "platt_a": 1.0,
+  "platt_b": 0.0,
+  "symbol": "XAU/USD",
   "arch": "tcn",
-  "symbol": "EUR/USD"
+  "brier_before": 0.41021806897542,
+  "brier_after": 0.4036346984434824,
+  "n_active_val": 65,
+  "slice": [
+    0.6,
+    0.8
+  ]
 }

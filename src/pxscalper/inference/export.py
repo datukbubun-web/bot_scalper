@@ -256,8 +256,11 @@ def export_all(
         model_config=cfg.to_dict(),
         latency_us=latency,
     )
+    manifest_payload = result.to_dict()
+    manifest_payload["torchscript_path"] = ts_path.name if ts_path else None
+    manifest_payload["onnx_path"] = onnx_path.name if onnx_path else None
     (out_dir / f"{arch}.manifest.json").write_text(
-        json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+        json.dumps(manifest_payload, indent=2), encoding="utf-8"
     )
     log.info(
         "%s latency p50/p99 us: eager %.0f/%.0f | ts %.0f/%.0f | ort %.0f/%.0f",

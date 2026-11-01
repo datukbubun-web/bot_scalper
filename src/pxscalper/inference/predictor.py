@@ -66,6 +66,8 @@ class Calibration:
     temperature: float = 1.0
     platt_a: float = 1.0
     platt_b: float = 0.0
+    symbol: str | None = None
+    arch: str | None = None
 
     def apply(self, probs: np.ndarray) -> np.ndarray:
         if self.temperature == 1.0 or len(probs) != 3:
@@ -75,17 +77,58 @@ class Calibration:
         exp = np.exp(logits)
         return exp / exp.sum()
 
+    def save(self, path: str | Path, **extra: Any) -> None:
+        payload: dict[str, Any] = {
+            "temperature": float(self.temperature),
+            "platt_a": float(self.platt_a),
+            "platt_b": float(self.platt_b),
+        }
+        if self.symbol:
+            payload["symbol"] = self.symbol
+        if self.arch:
+            payload["arch"] = self.arch
+        payload.update(extra)
+        Path(path).write_text(json.dumps(payload, indent=2))
+
     @classmethod
-    def load(cls, path: str | Path) -> "Calibration":
+    def load(
+        cls, path: str | Path, expected_symbol: str | None = None
+    ) -> "Calibration":
         p = Path(path)
         if not p.exists():
             return cls()
         raw = json.loads(p.read_text())
+        cal_symbol = raw.get("symbol")
+        if expected_symbol and cal_symbol and str(cal_symbol).upper() != str(expected_symbol).upper():
+            log.warning(
+                "ignoring cross-symbol calibration %s (calibrated for %s, expected %s)",
+                p, cal_symbol, expected_symbol,
+            )
+            return cls()
         return cls(
             temperature=float(raw.get("temperature", 1.0)),
             platt_a=float(raw.get("platt_a", 1.0)),
             platt_b=float(raw.get("platt_b", 0.0)),
+            symbol=cal_symbol,
+            arch=raw.get("arch"),
         )
+
+
+def _resolve_manifest_artifact(manifest_dir: Path, raw_path: str | None) -> str | None:
+    """Resolve portable relative filenames OR stale foreign-machine absolute paths."""
+    if not raw_path:
+        return None
+    p = Path(raw_path)
+    if not p.is_absolute():
+        candidate = manifest_dir / p
+        if candidate.exists():
+            return str(candidate)
+    if p.exists():
+        return str(p)
+    fallback = manifest_dir / p.name
+    if fallback.exists():
+        return str(fallback)
+    return str(manifest_dir / p.name) if not p.is_absolute() else raw_path
 
 
 @dataclass
@@ -102,6 +145,7 @@ class PredictorConfig:
     confidence_threshold: float = 0.45   # below this -> FLAT
     edge_threshold: float = 0.0          # |P(up)-P(down)| gate
     calibration_path: str | None = None
+    expected_symbol: str | None = None
     intra_op_threads: int = 1
     graph_optimisation: str = "all"      # all | basic | extended | none
     model_version: str = "unknown"
@@ -109,16 +153,35 @@ class PredictorConfig:
 
     @classmethod
     def from_manifest(cls, manifest_path: str | Path, **overrides) -> "PredictorConfig":
-        raw = json.loads(Path(manifest_path).read_text())
+        mpath = Path(manifest_path)
+        mdir = mpath.parent
+        raw = json.loads(mpath.read_text())
         mc = raw.get("model_config", {})
+        cal_default = mdir / "calibration.json"
+        rep_path = mdir / "training_report.json"
+        model_sym = raw.get("symbol")
+        if not model_sym and rep_path.exists():
+            try:
+                model_sym = json.loads(rep_path.read_text()).get("symbol")
+            except Exception:  # noqa: BLE001
+                model_sym = None
+        req_sym = overrides.get("expected_symbol")
+        if req_sym and model_sym and str(req_sym).upper() != str(model_sym).upper():
+            raise ValueError(
+                f"model {mpath} was trained for {model_sym}, cannot run on {req_sym}"
+            )
+        ckpt_default = mdir / f"{raw.get('arch', 'tcn')}.pt"
         base = cls(
-            onnx_path=raw.get("onnx_path"),
-            torchscript_path=raw.get("torchscript_path"),
+            onnx_path=_resolve_manifest_artifact(mdir, raw.get("onnx_path")),
+            torchscript_path=_resolve_manifest_artifact(mdir, raw.get("torchscript_path")),
+            torch_checkpoint=str(ckpt_default) if ckpt_default.exists() else None,
             arch=raw.get("arch", "tcn"),
             n_features=int(mc.get("n_features", 31)),
             lookback=int(mc.get("lookback", 64)),
             n_outputs=int(mc.get("n_outputs", 3)),
             task=mc.get("task", "classification"),
+            calibration_path=str(cal_default) if cal_default.exists() else None,
+            expected_symbol=model_sym,
             model_version=raw.get("arch", "unknown") + "-" + str(raw.get("hash", ""))[:8],
         )
         for key, value in overrides.items():
@@ -135,7 +198,9 @@ class Predictor:
     def __init__(self, config: PredictorConfig) -> None:
         self.config = config
         self.calibration = (
-            Calibration.load(config.calibration_path) if config.calibration_path else Calibration()
+            Calibration.load(config.calibration_path, expected_symbol=config.expected_symbol)
+            if config.calibration_path
+            else Calibration()
         )
         self._backend = config.backend.lower()
         self._input_name = "features"

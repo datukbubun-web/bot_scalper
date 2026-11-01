@@ -70,6 +70,7 @@ class BacktestConfig:
     max_gross_exposure_pct: float = 300.0
     min_qty: float = 0.0
     qty_step: float = 0.0
+    pnl_coefficient: float = 1.0
     #: How to resolve a bar that touches BOTH stop and target. Bars are OHLC, so
     #: the true intrabar path is unknown; guessing silently is how backtests lie.
     #:   "pessimistic" -- assume the stop was hit first (lower bound)
@@ -170,9 +171,13 @@ class Backtester:
         if "bid" in bars and "ask" in bars and bars["bid"].notna().any():
             bid = bars["bid"].to_numpy(dtype=np.float64)
             ask = bars["ask"].to_numpy(dtype=np.float64)
+            entry_bid, entry_ask = bid, ask
         else:
-            half = close * cfg.spread_bps_fallback / 1e4 / 2
-            bid, ask = close - half, close + half
+            half_close = close * cfg.spread_bps_fallback / 1e4 / 2
+            bid, ask = close - half_close, close + half_close
+            half_open = open_ * cfg.spread_bps_fallback / 1e4 / 2
+            entry_bid, entry_ask = open_ - half_open, open_ + half_open
+        coeff = max(float(cfg.pnl_coefficient), 1e-12)
 
         # ``window_end_idx`` holds, for each window, the *positional* index of the
         # bar whose close the signal was computed at -- so the next bar is the
@@ -225,7 +230,7 @@ class Backtester:
                     exit_price, reason = position["stop"], "stop"
                 elif target_hit:
                     exit_price, reason = target, "target"
-                elif bars_held >= cfg.max_holding_bars:
+                elif bars_held >= int(position.get("max_hold_bars", cfg.max_holding_bars)):
                     exit_price, reason = close[bar_idx], "time"
                 elif cfg.trailing_stop_atr > 0:
                     trail = (
@@ -242,8 +247,8 @@ class Backtester:
                 if exit_price is not None:
                     exit_side_price = bid[bar_idx] if side > 0 else ask[bar_idx]
                     fill = exit_price if reason in ("stop", "target") else exit_side_price
-                    gross = side * (fill - position["entry_price"]) * position["qty"]
-                    fee = fill * position["qty"] * cfg.taker_fee_pct / 100
+                    gross = side * (fill - position["entry_price"]) * position["qty"] * coeff
+                    fee = fill * position["qty"] * coeff * cfg.taker_fee_pct / 100
                     equity_now = equity + gross - fee
                     trade = Trade(
                         entry_time=position["entry_time"],
@@ -271,7 +276,12 @@ class Backtester:
 
             # ------------------------------------------------------------ entries
             if position is None and row > 0:
-                direction, conf, edge = signal_fn(row, window)
+                sig_out = signal_fn(row, window)
+                if len(sig_out) == 4:
+                    direction, conf, edge, exec_meta = sig_out  # type: ignore[misc]
+                else:
+                    direction, conf, edge = sig_out  # type: ignore[misc]
+                    exec_meta = None
                 if (
                     direction != 0
                     and conf >= cfg.min_confidence
@@ -282,18 +292,25 @@ class Backtester:
                     if entry_bar >= len(close):
                         break
                     side = 1 if direction > 0 else -1
-                    raw_price = ask[entry_bar] if side > 0 else bid[entry_bar]
-                    # risk-based sizing: risk_amount / stop_distance
-                    risk_amount = equity * cfg.risk_per_trade_pct / 100.0
-                    qty = risk_amount / max(cfg.sl_atr * price_risk, 1e-12)
+                    raw_price = entry_ask[entry_bar] if side > 0 else entry_bid[entry_bar]
+                    size_mult = float((exec_meta or {}).get("size_multiplier", 1.0))
+                    sl_mult = float((exec_meta or {}).get("sl_atr_mult", 1.0))
+                    tp_mult = float((exec_meta or {}).get("tp_atr_mult", 1.0))
+                    hold_mult = float((exec_meta or {}).get("max_hold_mult", 1.0))
+                    eff_sl_atr = max(cfg.sl_atr * sl_mult, 1e-6)
+                    eff_tp_atr = cfg.tp_atr * tp_mult if cfg.tp_atr else 0.0
+                    eff_hold = max(1, int(round(cfg.max_holding_bars * hold_mult)))
+                    # risk-based sizing: risk_amount / (stop_distance * pnl_coefficient)
+                    risk_amount = equity * (cfg.risk_per_trade_pct * size_mult) / 100.0
+                    qty = risk_amount / max(eff_sl_atr * price_risk * coeff, 1e-12)
                     # cap notional by leverage / gross exposure (as the live engine does)
                     max_notional = min(
                         equity * cfg.max_leverage, equity * cfg.max_gross_exposure_pct / 100.0
                     )
-                    qty = min(qty, max_notional / max(raw_price, 1e-9))
+                    qty = min(qty, max_notional / max(raw_price * coeff, 1e-9))
                     if cfg.qty_step > 0:
-                        qty = (qty // cfg.qty_step) * cfg.qty_step
-                    if qty <= 0 or qty < cfg.min_qty:
+                        qty = round(math.floor((qty + 1e-12) / cfg.qty_step) * cfg.qty_step, 10)
+                    if qty <= 0 or qty + 1e-12 < cfg.min_qty:
                         qty = 0.0
                     # sqrt-law slippage, capped to a sane band
                     participation = qty / max(volume[entry_bar], 1.0)
@@ -310,15 +327,16 @@ class Backtester:
                         result.equity_curve.append(equity)
                         result.timestamps.append(int(times[bar_idx]))
                         continue
-                    entry_fee = fill * qty * cfg.taker_fee_pct / 100
+                    entry_fee = fill * qty * coeff * cfg.taker_fee_pct / 100
                     position = {
                         "entry_bar": entry_bar,
                         "entry_time": int(times[entry_bar]),
                         "entry_price": float(fill),
                         "qty": float(qty),
                         "side": side,
-                        "stop": float(fill - side * cfg.sl_atr * price_risk),
-                        "target": float(fill + side * cfg.tp_atr * price_risk) if cfg.tp_atr else None,
+                        "stop": float(fill - side * eff_sl_atr * price_risk),
+                        "target": float(fill + side * eff_tp_atr * price_risk) if eff_tp_atr else None,
+                        "max_hold_bars": eff_hold,
                         "entry_fee": float(entry_fee),
                         "slippage": float(slip_bps),
                         "confidence": float(conf),
@@ -339,14 +357,20 @@ class Backtester:
         if len(equity) < 2:
             return {"n_trades": float(len(result.trades))}
         rets = np.diff(equity) / np.maximum(equity[:-1], 1e-9)
-        n_years = len(rets) / cfg.periods_per_year
+        periods_per_year = float(cfg.periods_per_year)
+        if cfg.periods_per_year == 1440 * 252 and len(result.timestamps) >= 3:
+            dt_ms = float(np.median(np.diff(np.asarray(result.timestamps, dtype=np.int64))))
+            if dt_ms > 90_000:
+                bars_per_day = max(1.0, 86_400_000.0 / dt_ms)
+                periods_per_year = bars_per_day * 252.0
+        n_years = len(rets) / periods_per_year
         total_return = equity[-1] / equity[0] - 1
         annual = (1 + total_return) ** (1 / max(n_years, 1e-9)) - 1 if total_return > -1 else -1.0
         std = rets.std()
-        sharpe = float(rets.mean() / std * math.sqrt(cfg.periods_per_year)) if std > 0 else 0.0
+        sharpe = float(rets.mean() / std * math.sqrt(periods_per_year)) if std > 0 else 0.0
         downside = rets[rets < 0]
         sortino = (
-            float(rets.mean() / downside.std() * math.sqrt(cfg.periods_per_year))
+            float(rets.mean() / downside.std() * math.sqrt(periods_per_year))
             if len(downside) > 1 and downside.std() > 0
             else 0.0
         )
@@ -373,7 +397,14 @@ class Backtester:
             "profit_factor": float(gross_win / gross_loss) if gross_loss > 0 else float("inf"),
             "expectancy_bps": float(np.mean([t.pnl_bps for t in trades])) if trades else 0.0,
             "avg_bars_held": float(np.mean([t.bars_held for t in trades])) if trades else 0.0,
-            "cost_drag_bps": float(np.mean([(t.fees / max(t.qty * t.entry_price, 1e-9)) * 1e4 for t in trades]))
+            "cost_drag_bps": float(
+                np.mean(
+                    [
+                        (t.fees / max(t.qty * t.entry_price * max(cfg.pnl_coefficient, 1e-12), 1e-9)) * 1e4
+                        for t in trades
+                    ]
+                )
+            )
             if trades
             else 0.0,
             "final_equity": float(equity[-1]),

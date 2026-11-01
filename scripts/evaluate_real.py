@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 """Evaluate a trained model on REAL cached bars, with cost sensitivity.
 
-Why this script exists: a single backtest number is a marketing figure. A desk
-asks "how much of the result survives costs?" -- so we run the same signal under
-three cost assumptions:
-
-    demo       : PrimeXBT demo FX (taker 0%, spread ~0.2 bps, measured)
-    realistic  : live-like FX (spread 0.9 bps, 0.01%/side)
-    punitive   : spread 2 bps, 0.05%/side (crypto-grade costs)
-
-A signal that only works in the first column does not exist.
-
-    python scripts/evaluate_real.py --arch tcn --symbol EUR/USD --bars 1M
+    python scripts/evaluate_real.py --arch tcn --symbol XAU/USD --bars 5M
 """
 
 from __future__ import annotations
@@ -22,7 +12,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -31,98 +20,123 @@ from pxscalper.data.pipeline import DataPipeline  # noqa: E402
 from pxscalper.features.labels import LabelConfig, volatility_scaled_labels  # noqa: E402
 from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer  # noqa: E402
 from pxscalper.inference.predictor import load_predictor  # noqa: E402
-from pxscalper.utils import RepoPaths, setup_logging  # noqa: E402
-
-COST_SCENARIOS = {
-    "demo (taker 0%, spread 0.2bps)": dict(taker_fee_pct=0.0, spread_bps_fallback=0.2),
-    "realistic (spread 0.9bps, 0.01%/side)": dict(taker_fee_pct=0.01, spread_bps_fallback=0.9),
-    "punitive (spread 2.0bps, 0.05%/side)": dict(taker_fee_pct=0.05, spread_bps_fallback=2.0),
-}
+from pxscalper.ops.backtest_runner import load_context_frames  # noqa: E402
+from pxscalper.risk.engine import pnl_coefficient  # noqa: E402
+from pxscalper.utils import RepoPaths, bar_ms, setup_logging  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arch", default="tcn")
-    ap.add_argument("--symbol", default="EUR/USD")
-    ap.add_argument("--bars", default="1M")
+    ap.add_argument("--symbol", default="XAU/USD")
+    ap.add_argument("--bars", default="5M")
     ap.add_argument("--version", default="latest")
+    ap.add_argument("--model-dir", default=None)
     ap.add_argument("--out", default="artifacts/eval")
-    ap.add_argument("--horizon", type=int, default=5, help="must match training horizon")
-    ap.add_argument("--n-bars", type=int, default=0,
-                    help="use only the last N cached bars (0 = all). Windows are "
-                         "38x64 float32 each, so 200k bars needs ~1.9 GB of RAM")
-    ap.add_argument("--oos-frac", type=float, default=0.25,
+    ap.add_argument("--horizon", type=int, default=12, help="must match training horizon")
+    ap.add_argument("--n-bars", type=int, default=0)
+    ap.add_argument("--oos-frac", type=float, default=0.20,
                     help="evaluate only the last N%% of windows (held-out). "
                          "0 = all windows (in-sample, optimistic -- not a result)")
-    ap.add_argument("--live-spread-bps", type=float, default=0.2,
-                    help="spread you actually measured on the venue for this symbol")
-    ap.add_argument("--sl-atr", type=float, default=1.5)
-    ap.add_argument("--tp-atr", type=float, default=1.5)
-    ap.add_argument("--max-holding", type=int, default=24)
+    ap.add_argument("--live-spread-bps", type=float, default=0.49,
+                    help="spread measured on PrimeXBT for this symbol")
+    ap.add_argument("--sl-atr", type=float, default=3.5)
+    ap.add_argument("--tp-atr", type=float, default=0.0)
+    ap.add_argument("--max-holding", type=int, default=12)
+    ap.add_argument("--min-confidence", type=float, default=0.42)
+    ap.add_argument("--min-edge", type=float, default=0.10)
     args = ap.parse_args()
 
     setup_logging()
     paths = RepoPaths().ensure()
-    bars = DataPipeline(cache_dir=paths.data).load(args.symbol, args.bars)
+    model_dir = Path(args.model_dir) if args.model_dir else paths.model_dir(args.version)
+    pipeline = DataPipeline(cache_dir=paths.data)
+    bars = pipeline.load(args.symbol, args.bars)
     if bars is None:
-        print(f"no cached data for {args.symbol}; run `pxs data` first")
+        print(f"no cached data for {args.symbol} {args.bars}; run `pxs data` first")
         return 1
 
     if args.n_bars and len(bars) > args.n_bars:
         bars = bars.tail(args.n_bars).reset_index(drop=True)
-    engineer = FeatureEngineer(FeatureConfig())
-    features = engineer.transform_normalized(bars)
+
+    predictor = load_predictor(
+        model_dir,
+        arch=args.arch,
+        expected_symbol=args.symbol,
+        confidence_threshold=0.0,
+        edge_threshold=0.0,
+    )
+    feat_json = model_dir / "features.json"
+    engineer = FeatureEngineer(FeatureConfig.load(feat_json) if feat_json.exists() else FeatureConfig())
+    context_map = load_context_frames(pipeline, engineer, bar_size=args.bars)
+    features = engineer.transform_normalized(bars, context=context_map)
     labels = volatility_scaled_labels(bars, LabelConfig(horizon=args.horizon))
     common = features.index.intersection(labels.index)
-    windows, end_idx = engineer.make_windows(features.loc[common], 64)
+    windows, end_idx = engineer.make_windows(features.loc[common], predictor.config.lookback)
     frame = bars.loc[common].reset_index(drop=True)
     atr = labels.loc[common, "atr"].to_numpy()
     n = min(len(windows), len(end_idx))
     windows, end_idx = windows[:n], end_idx[:n]
 
-    predictor = load_predictor(
-        paths.model_dir(args.version), arch=args.arch,
-        confidence_threshold=0.0, edge_threshold=0.0,
-    )
-
-    # held-out slice only: training used the first 75%, evaluating the whole
-    # sample reports the model's memory, not its skill.
     oos_start = int(len(windows) * (1.0 - args.oos_frac)) if args.oos_frac > 0 else 0
     live = args.live_spread_bps
+    is_metal = args.symbol.upper().startswith(("XAU/", "XAG/"))
     scenarios = {
         f"measured venue (spread {live:.2f}bps, taker 0%)": dict(
-            taker_fee_pct=0.0, spread_bps_fallback=live),
-        f"venue + 0.01%/side (spread {live:.2f}bps)": dict(
-            taker_fee_pct=0.01, spread_bps_fallback=live),
-        f"2x cost (spread {2 * live:.2f}bps, 0.01%/side)": dict(
-            taker_fee_pct=0.01, spread_bps_fallback=2 * live),
+            taker_fee_pct=0.0, spread_bps_fallback=live
+        ),
+        "realistic execution (spread 0.65bps, taker 0%)": dict(
+            taker_fee_pct=0.0, spread_bps_fallback=0.65 if is_metal else max(live * 1.35, 0.9)
+        ),
+        f"2x cost stress (spread {max(2 * live, 1.30):.2f}bps)": dict(
+            taker_fee_pct=0.0 if is_metal else 0.01,
+            spread_bps_fallback=max(2 * live, 1.30),
+        ),
     }
     if not args.oos_frac:
         print("WARNING: --oos-frac 0 evaluates in-sample; the numbers are optimistic",
               file=sys.stderr)
 
+    preds_cache: dict[int, tuple[int, float, float]] = {}
+
     def signal(row: int, window: np.ndarray):
         if row < oos_start:
             return 0, 0.0, 0.0
+        cached = preds_cache.get(row)
+        if cached is not None:
+            return cached
         pred = predictor.predict(window)
-        return pred.direction, pred.confidence, pred.edge
+        out = (pred.direction, pred.confidence, pred.edge)
+        preds_cache[row] = out
+        return out
+
+    ref_px = float(frame["close"].median())
+    coeff = pnl_coefficient(args.symbol, ref_px)
+    dt_ms = bar_ms(args.bars)
+    bpd = max(1, int(round(86_400_000 / dt_ms)))
+    step = 0.01 if is_metal else 0.0
 
     results = {}
     for name, costs in scenarios.items():
         config = BacktestConfig(
             initial_equity=10_000.0,
-            min_confidence=0.42,
-            min_edge=0.03,
+            min_confidence=args.min_confidence,
+            min_edge=args.min_edge,
             sl_atr=args.sl_atr,
             tp_atr=args.tp_atr,
             max_holding_bars=args.max_holding,
+            min_qty=step,
+            qty_step=step,
+            pnl_coefficient=coeff,
+            bars_per_day=bpd,
+            periods_per_year=bpd * 252,
             **costs,
         )
         result = Backtester(config).run(frame, windows, end_idx, atr, signal)
         results[name] = result
         m = result.metrics
         print(
-            f"{name:42s} trades {m.get('n_trades', 0):5.0f} | "
+            f"{name:46s} trades {m.get('n_trades', 0):5.0f} | "
             f"return {m.get('total_return_pct', 0):+7.2f}% | "
             f"sharpe {m.get('sharpe', 0):6.2f} | "
             f"win {m.get('win_rate_pct', 0):5.1f}% | "
@@ -130,15 +144,16 @@ def main() -> int:
             f"DD {m.get('max_drawdown_pct', 0):5.2f}%"
         )
 
-    # ---- signal quality, independent of trading rules ----------------------
     y_true, y_pred = [], []
     for row in range(oos_start, len(windows)):
-        pred = predictor.predict(windows[row])
+        d, _, _ = signal(row, windows[row])
         y_true.append(labels.loc[common, "y_dir"].to_numpy()[end_idx[row]])
-        y_pred.append(pred.direction)
+        y_pred.append(d)
     y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    traded = y_pred != 0
+    hit_traded = float((y_pred == y_true)[traded].mean()) if traded.any() else float("nan")
     nonflat = y_true != 0
-    hit = (y_pred == y_true)[nonflat].mean() if nonflat.any() else float("nan")
+    hit_nonflat = float((y_pred == y_true)[nonflat].mean()) if nonflat.any() else float("nan")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +161,7 @@ def main() -> int:
         "symbol": args.symbol,
         "arch": args.arch,
         "bars": int(len(bars)),
+        "bar_size": args.bars,
         "windows": int(len(windows)),
         "period": {
             "from_ms": int(bars["time"].iloc[0]),
@@ -159,13 +175,14 @@ def main() -> int:
         },
         "signal_quality": {
             "accuracy_all": float((y_pred == y_true).mean()),
-            "accuracy_nonflat": float(hit),
+            "accuracy_nonflat": hit_nonflat,
+            "hit_rate_when_trading": hit_traded,
             "share_flat_predictions": float((y_pred == 0).mean()),
             "share_flat_labels": float((y_true == 0).mean()),
         },
         "cost_scenarios": {name: r.metrics for name, r in results.items()},
     }
-    (out_dir / f"{args.symbol.replace('/', '')}_{args.arch}_eval.json").write_text(
+    (out_dir / f"{args.symbol.replace('/', '')}_{args.bars}_{args.arch}_eval.json").write_text(
         json.dumps(summary, indent=2)
     )
     print("\nsignal quality:", json.dumps(summary["signal_quality"], indent=2))
