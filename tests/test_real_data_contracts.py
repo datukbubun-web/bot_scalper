@@ -13,7 +13,7 @@ import pytest
 
 from pxscalper.backtest.engine import BacktestConfig, Backtester
 from pxscalper.data.pipeline import DataPipeline
-from pxscalper.exchange.catalogue import Instrument, SymbolResolver, resolve_units
+from pxscalper.exchange.catalogue import Instrument, resolve_units
 from pxscalper.exchange.models import SymbolSettings
 from pxscalper.risk.engine import RiskConfig, RiskDecision, RiskEngine, RiskState
 

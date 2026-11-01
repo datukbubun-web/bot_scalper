@@ -1,17 +1,14 @@
-# Preset: akun mini $100 — XAU/USD, safety-first.
+# Preset: akun mini $100 — XAU/USD Arsitektur Hybrid, safety-first.
 #
 # Angka di file ini bukan pilihan selera. Setiap nilai punya alasan yang bisa
-# diperiksa ulang dengan `pxs catalogue` dan hasil uji di docs/.
+# diperiksa ulang dengan `pxs catalogue` dan hasil uji OOS di docs/XAUUSD_REPORT.md.
 #
 # Kenyataan akun $100 di venue ini (diukur, bukan diperkirakan):
 #   XAU/USD : 1 qtyStep = 0.01 oz ≈ $40.67 notional, spread 0.49 bps
 #   Slippage order 100 oz ($407k): 0 — jadi ukuran kita tidak akan menggerakkan harga
 #   Biaya spread pada posisi $500: $0.025 (0.025% akun) — sangat kecil
-#   ATR 1M ≈ 3.5 bps -> stop 1.0xATR = 3.5 bps
-#
-# Yang TIDAK dilakukan file ini: membuat bot ini menguntungkan. Hasil uji pada
-# 204 hari data nyata: tidak ada edge arah (edge terukur negatif). Konfigurasi ini
-# dirancang untuk MEMBATASI kerugian, bukan untuk menghasilkan profit.
+#   Layer 1 (15M Intraday Bias + Session VWAP) + Layer 2 (5M Skip-TCN Execution)
+#   Tetap jalankan dry_run/DEMO terlebih dahulu dan patuhi seluruh batas risiko.
 
 symbols: ["XAU/USD"]
 bar_size: "5M"
@@ -20,6 +17,7 @@ horizon: 12
 
 inference:
   backend: "onnx"
+  model_dir: "artifacts/xau_hybrid_5M"
   confidence_threshold: 0.45
   edge_threshold: 0.03
 
@@ -90,7 +88,6 @@ risk:
   min_confidence: 0.45
   min_edge: 0.03
 
-  max_daily_loss_stop: true
   allow_hedging: false
 
 # ---- target profit gabungan: tutup SEMUA posisi ----------------------

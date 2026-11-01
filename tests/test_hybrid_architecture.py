@@ -22,10 +22,7 @@ from typer.testing import CliRunner
 
 from pxscalper.cli import app
 from pxscalper.features.mtf import (
-    MTFBiasConfig,
     align_htf_to_ltf,
-    compute_mtf_bias_features,
-    intraday_session_features,
     resample_ohlcv_causal,
 )
 from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer

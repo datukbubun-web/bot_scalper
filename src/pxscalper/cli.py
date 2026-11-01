@@ -23,7 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__
-from .utils import RepoPaths, load_dotenv, now_ms, setup_logging
+from .utils import RepoPaths, load_dotenv, setup_logging
 
 app = typer.Typer(add_completion=False, help="pxscalper -- FX scalping stack for PrimeXBT")
 console = Console()
@@ -107,7 +107,6 @@ def doctor(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
         except typer.Exit:
             client = None
     if client is not None:
-        from .exchange.signing import ApiCredentials
 
         try:
             offset = client.sync_clock()
@@ -197,7 +196,7 @@ def smoke(
 
 @app.command()
 def backtest(
-    config: str = typer.Option("configs/live.example.yaml"),
+    config: str = typer.Option("configs/live.hybrid.yaml"),
     synthetic: bool = typer.Option(False, help="use synthetic data instead of cache"),
     oos_frac: float = typer.Option(
         0.0, "--oos-frac", help="evaluate only the last fraction of windows (e.g. 0.40)"
@@ -329,8 +328,9 @@ def bias(
     table.add_row("last closed bar", str(last_ts), f"close={float(ltf_tail['close'].iloc[-1]):,.2f}")
     table.add_row("intraday direction", snap.direction.value, f"composite bias={snap.bias_score:+.3f}")
     table.add_row("market regime", snap.regime.value, f"roll_blackout={snap.roll_blackout}")
+    ltf_fv_label = "5M scalper FV score" if bs_up == "1M" else f"{bs_up} scalper FV score"
     table.add_row(f"{htf_up} fair-value score", f"{snap.htf_fv_score:+.3f}", f"driver={context_symbol}")
-    table.add_row(f"{bs_up} scalper FV score", f"{snap.ltf_fv_score:+.3f}", "short-horizon dislocation")
+    table.add_row(ltf_fv_label, f"{snap.ltf_fv_score:+.3f}", "short-horizon dislocation")
     table.add_row("session VWAP trend", f"{snap.session_trend:+.3f}", f"vwap_z={snap.session_vwap_z:+.2f}")
     table.add_row("volatility regime", f"{snap.vol_regime_ratio:.2f}x", f"2H ER={snap.efficiency_ratio:.2f}")
     table.add_row(
@@ -348,7 +348,7 @@ def bias(
 
 @app.command()
 def trade(
-    config: str = typer.Option("configs/live.example.yaml"),
+    config: str = typer.Option("configs/live.hybrid.yaml"),
     i_understand_the_risk: bool = typer.Option(
         False, "--i-understand-the-risk", help="required to send real orders"
     ),
@@ -509,7 +509,7 @@ def risk_show(
     things, and confusing them is how a small account dies.
     """
     _bootstrap()
-    from .ops.config_edit import TOP_LEVEL_DEFAULTS, describe, read_effective, read_top_level
+    from .ops.config_edit import describe, read_effective, read_top_level
 
     if not Path(config).exists():
         console.print(f"[red]{config} not found[/red]")
@@ -556,6 +556,7 @@ def risk_set(
         TOP_LEVEL_DEFAULTS,
         ConfigEditError,
         read_risk,
+        read_top_level,
         set_top_level,
         set_values,
         summarise,
@@ -586,6 +587,8 @@ def risk_set(
             console.print("[yellow]dry run — nothing written[/yellow]")
             for k, v in updates.items():
                 console.print(f"  {k}: {current.get(k)!r} -> {format_value(coerce(k, v))}")
+            for k, v in top_updates.items():
+                console.print(f"  {k}: {current.get(k)!r} -> {v}")
             raise typer.Exit(0)
         changes = set_values(config, updates) if updates else []
         if top_updates:
@@ -619,7 +622,7 @@ def reconcile() -> None:
 @app.command()
 def kill(reason: str = typer.Option("cli", help="reason recorded in the switch file")) -> None:
     """Engage the kill switch (halts the loop and flattens)."""
-    boot = _bootstrap()
+    _bootstrap()
     from .risk.engine import KillSwitch
 
     KillSwitch(Path("state/KILL")).engage(reason)

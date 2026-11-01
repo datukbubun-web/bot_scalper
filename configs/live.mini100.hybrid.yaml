@@ -68,7 +68,6 @@ risk:
   max_atr_bps: 15.0
   min_confidence: 0.45
   min_edge: 0.03
-  max_daily_loss_stop: true
   allow_hedging: false
 
 close_all_on_profit: 3.0

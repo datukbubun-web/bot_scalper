@@ -73,6 +73,7 @@ def _normalise_position(raw: Any) -> dict[str, Any]:
             "side": getattr(raw, "side", ""),
             "qty": getattr(raw, "qty", 0.0),
             "exposure": getattr(raw, "exposure", None),
+            "open_time": getattr(raw, "open_time", 0),
             "mark_price": getattr(raw, "mark_price", None)
             or getattr(raw, "current_price", None)
             or getattr(raw, "open_price", None),
@@ -691,7 +692,12 @@ class RiskEngine:
         checks["cooldown_ok"] = now_ms >= self.state.cooldown_until_ms
         if not checks["cooldown_ok"]:
             return verdict(RiskDecision.FLAT, "cooldown after consecutive losses")
-        checks["trade_budget_ok"] = self.state.trades_today < cfg.max_daily_trades
+        day_start_ms = (int(now_ms) // 86_400_000) * 86_400_000
+        open_today = sum(
+            1 for p in positions if int(p.get("open_time") or 0) >= day_start_ms
+        )
+        details["open_today"] = open_today
+        checks["trade_budget_ok"] = (self.state.trades_today + open_today) < cfg.max_daily_trades
         if not checks["trade_budget_ok"]:
             return verdict(RiskDecision.BLOCK, "daily trade budget exhausted")
 

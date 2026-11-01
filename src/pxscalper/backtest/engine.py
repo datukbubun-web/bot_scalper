@@ -249,7 +249,7 @@ class Backtester:
                     fill = exit_price if reason in ("stop", "target") else exit_side_price
                     gross = side * (fill - position["entry_price"]) * position["qty"] * coeff
                     fee = fill * position["qty"] * coeff * cfg.taker_fee_pct / 100
-                    equity_now = equity + gross - fee
+                    equity_now = equity + gross - fee - position["entry_fee"]
                     trade = Trade(
                         entry_time=position["entry_time"],
                         exit_time=int(times[bar_idx]),

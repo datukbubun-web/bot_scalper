@@ -161,6 +161,12 @@ def run_backtest_from_config(
     model_dir = _resolve_model_dir(paths, inf_raw)
 
     expected_sym = symbols[0] if len(symbols) == 1 else None
+    manifest_file = model_dir / f"{arch}.manifest.json"
+    if manifest_file.exists():
+        from ..inference.predictor import PredictorConfig
+
+        for sym in symbols:
+            PredictorConfig.from_manifest(manifest_file, expected_symbol=sym)
     predictor = load_predictor(
         model_dir,
         arch=arch,
@@ -300,11 +306,15 @@ def run_backtest_from_config(
             periods_per_year=bpd * 252,
         )
         result = Backtester(config).run(frame, windows, window_idx, atr, _signal)
+        result.metrics = {
+            k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
+            for k, v in result.metrics.items()
+        }
         result.metrics["symbol"] = symbol  # type: ignore[assignment]
         log.info(
             "%s: %s",
             symbol,
-            {k: round(v, 2) if isinstance(v, float) else v for k, v in result.metrics.items() if k != "symbol"},
+            {k: round(float(v), 2) if isinstance(v, (int, float, np.floating)) else v for k, v in result.metrics.items() if k != "symbol"},
         )
         all_results.append(result)
 
@@ -318,11 +328,17 @@ def run_backtest_from_config(
     if not all_results:
         raise RuntimeError("no backtest produced results (missing data or models)")
 
+    if len(all_results) == 1:
+        return all_results[0]
+
+    merged_trades = [t for r in all_results for t in r.trades]
+    merged_metrics = dict(all_results[0].metrics)
+    merged_metrics["n_trades"] = float(len(merged_trades))
     merged = BacktestResult(
-        trades=[t for r in all_results for t in r.trades],
+        trades=merged_trades,
         equity_curve=all_results[0].equity_curve,
         timestamps=all_results[0].timestamps,
-        metrics=all_results[0].metrics,
+        metrics=merged_metrics,
         config=all_results[0].config,
     )
     return merged

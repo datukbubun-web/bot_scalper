@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -216,7 +216,6 @@ class Predictor:
 
     # ------------------------------------------------------------------ loading
     def _load(self) -> None:
-        cfg = self.config
         if self._backend == "onnx":
             self._load_onnx()
         elif self._backend == "torchscript":

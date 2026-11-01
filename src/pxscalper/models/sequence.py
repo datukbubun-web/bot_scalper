@@ -26,8 +26,7 @@ containers in ``forward``, fixed attention masks computed in ``__init__``.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn

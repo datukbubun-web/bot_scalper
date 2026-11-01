@@ -6,7 +6,6 @@ engine would refuse, never double-send after a timeout, attach protection.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import pytest
 
