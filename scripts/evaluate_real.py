@@ -20,8 +20,10 @@ from pxscalper.data.pipeline import DataPipeline  # noqa: E402
 from pxscalper.features.labels import LabelConfig, volatility_scaled_labels  # noqa: E402
 from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer  # noqa: E402
 from pxscalper.inference.predictor import load_predictor  # noqa: E402
-from pxscalper.ops.backtest_runner import load_context_frames  # noqa: E402
+from pxscalper.ops.backtest_runner import load_context_frames, load_htf_frames  # noqa: E402
 from pxscalper.risk.engine import pnl_coefficient  # noqa: E402
+from pxscalper.strategy.decision import StrategyConfig  # noqa: E402
+from pxscalper.strategy.hybrid import HybridConfig, HybridStrategy  # noqa: E402
 from pxscalper.utils import RepoPaths, bar_ms, setup_logging  # noqa: E402
 
 
@@ -69,7 +71,21 @@ def main() -> int:
     feat_json = model_dir / "features.json"
     engineer = FeatureEngineer(FeatureConfig.load(feat_json) if feat_json.exists() else FeatureConfig())
     context_map = load_context_frames(pipeline, engineer, bar_size=args.bars)
-    features = engineer.transform_normalized(bars, context=context_map)
+    htf_bars_map, htf_ctx_map = load_htf_frames(
+        pipeline, engineer, symbol=args.symbol, ltf_bar_size=args.bars
+    )
+    span_mins: list[int] = []
+    if context_map:
+        span_mins.extend(int(cf["time"].min()) for cf in context_map.values() if not cf.empty)
+    if htf_ctx_map:
+        for cmap in htf_ctx_map.values():
+            span_mins.extend(int(cf["time"].min()) for cf in cmap.values() if not cf.empty)
+    if span_mins:
+        bars = bars[bars["time"] >= max(span_mins)].reset_index(drop=True)
+
+    features = engineer.transform_normalized(
+        bars, context=context_map, htf_bars=htf_bars_map, htf_context=htf_ctx_map
+    )
     labels = volatility_scaled_labels(bars, LabelConfig(horizon=args.horizon))
     common = features.index.intersection(labels.index)
     windows, end_idx = engineer.make_windows(features.loc[common], predictor.config.lookback)
@@ -97,7 +113,47 @@ def main() -> int:
         print("WARNING: --oos-frac 0 evaluates in-sample; the numbers are optimistic",
               file=sys.stderr)
 
-    preds_cache: dict[int, tuple[int, float, float]] = {}
+    manifest_file = model_dir / f"{args.arch}.manifest.json"
+    arch_mode = ""
+    if manifest_file.exists():
+        try:
+            arch_mode = str(json.loads(manifest_file.read_text()).get("architecture_mode", ""))
+        except Exception:  # noqa: BLE001
+            arch_mode = ""
+    use_hybrid = arch_mode.upper().startswith("HYBRID") or bool(engineer.mtf_names)
+    hybrid_strat = None
+    if use_hybrid:
+        is_1m = args.bars.upper() == "1M"
+        h_cfg = HybridConfig.from_dict(
+            {
+                "enabled": True,
+                "require_composite_threshold": True,
+                "composite_threshold": 1.85,
+                "require_micro_absorption": is_1m,
+                "min_wick_absorption": 0.03,
+                "wick_feature_col": "close_location",
+                "bias": {
+                    "htf_bar_size": "15M",
+                    "htf_rv_col": "htf_15m_xag_rv_z_2",
+                    "ltf_rv_col": "htf_5m_xag_rv_z_4" if is_1m else "ctx_xag_rv_z_4",
+                },
+            }
+        )
+        hybrid_strat = HybridStrategy(
+            predictor=predictor,
+            config=StrategyConfig(
+                min_confidence=args.min_confidence,
+                min_edge=args.min_edge,
+                require_rl_agreement=False,
+                size_by_edge=False,
+                min_seconds_between_trades=0.0,
+                cooldown_after_loss_s=0.0,
+            ),
+            hybrid_config=h_cfg,
+            feature_names=engineer.feature_names,
+        )
+
+    preds_cache: dict[int, tuple] = {}
 
     def signal(row: int, window: np.ndarray):
         if row < oos_start:
@@ -105,8 +161,16 @@ def main() -> int:
         cached = preds_cache.get(row)
         if cached is not None:
             return cached
-        pred = predictor.predict(window)
-        out = (pred.direction, pred.confidence, pred.edge)
+        if hybrid_strat is not None:
+            dec = hybrid_strat.decide(window)
+            out = (
+                (dec.intent.direction, dec.confidence, dec.edge)
+                if dec.is_trade
+                else (0, dec.confidence, dec.edge)
+            )
+        else:
+            pred = predictor.predict(window)
+            out = (pred.direction, pred.confidence, pred.edge)
         preds_cache[row] = out
         return out
 

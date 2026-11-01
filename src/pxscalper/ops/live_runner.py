@@ -17,7 +17,7 @@ from ..exchange.rest import PrimeXBTClient
 from ..exchange.signing import ApiCredentials
 from ..execution.router import ExecutionConfig, OrderRouter
 from ..features.pipeline import FeatureConfig
-from ..inference.predictor import PredictorConfig, Predictor, Calibration
+from ..inference.predictor import PredictorConfig, Predictor
 from ..live.engine import LiveConfig, LiveEngine
 from ..live.metrics import Metrics
 from ..live.reconcile import Reconciler
@@ -166,6 +166,11 @@ def build_engine(
         raise FileNotFoundError(
             f"{manifest} missing. Run `make train-{arch}` then `make export` first."
         )
+    # Validate every configured symbol against the manifest's symbol scope so a
+    # single-instrument model (e.g. XAU/USD) can never silently trade EUR/USD
+    # when len(symbols) > 1.
+    for sym in symbols:
+        PredictorConfig.from_manifest(manifest, expected_symbol=sym)
     expected_sym = symbols[0] if len(symbols) == 1 else None
     predictors = []
     for i in range(int(inf_raw.get("ensemble_size", 1)) or 1):

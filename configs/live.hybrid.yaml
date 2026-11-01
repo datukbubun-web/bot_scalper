@@ -13,7 +13,7 @@ live:
   symbols: ["XAU/USD"]
   bar_size: "5M"
   lookback: 64
-  warmup_bars: 900
+  warmup_bars: 1200
   settle_ms: 1200
   loop_sleep_s: 2.5
   max_hold_bars: 12
@@ -67,6 +67,7 @@ risk:
   sl_atr: 4.5
   tp_atr: 6.0
   max_holding_bars: 12
+  max_intraday_loss_pct: 2.0
   max_daily_loss_pct: 2.5
   max_drawdown_pct: 6.0
   max_daily_trades: 12

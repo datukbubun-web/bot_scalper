@@ -35,9 +35,9 @@ from ..execution.router import ExecutionResult, OrderRouter
 from ..features.pipeline import FeatureEngineer, FeatureConfig
 from ..inference.predictor import Predictor
 from ..risk.basket import BasketTarget
-from ..risk.engine import RiskEngine, RiskVerdict
-from ..strategy.decision import Decision, Intent, ScalpingStrategy
-from ..utils import JsonlLogger, bar_ms, now_ms
+from ..risk.engine import RiskEngine
+from ..strategy.decision import ScalpingStrategy
+from ..utils import JsonlLogger, bar_ms
 from .metrics import Metrics
 
 log = logging.getLogger(__name__)
@@ -111,6 +111,9 @@ class LiveEngine:
         self.htf_context_buffers: dict[tuple[str, str], pd.DataFrame] = {}
         self._last_decision_time: dict[str, int] = {}
         self._last_l2_probe: dict[str, float] = {}
+        self._known_positions: dict[int | str, Position] = {}
+        self._seen_fill_ids: set[int] = set()
+        self._position_hold_mult: dict[int | str, float] = {}
         self._last_trade_s = 0.0
         self._last_loss_s = 0.0
         self._last_settings_refresh = 0.0
@@ -142,6 +145,15 @@ class LiveEngine:
             return []
         ltf_ms = bar_ms(self.config.bar_size)
         return [str(tf).upper() for tf in mtf_cfg.htf_bar_sizes if bar_ms(tf) > ltf_ms]
+
+    def _htf_need_bars(self, htf_bar_size: str) -> int:
+        mtf_cfg = getattr(self.features, "_mtf_cfg", None)
+        tf_up = str(htf_bar_size).upper()
+        z_w = int(getattr(mtf_cfg, "zscore_by_tf", {}).get(tf_up, 96)) if mtf_cfg else 96
+        rv_w = int(getattr(mtf_cfg, "rv_norm_by_tf", {}).get(tf_up, 48)) if mtf_cfg else 48
+        ltf_span_ms = max(self.config.warmup_bars, 1500) * bar_ms(self.config.bar_size)
+        span_htf_bars = int(ltf_span_ms // max(bar_ms(tf_up), 60_000)) + 64
+        return max(500, z_w + rv_w + span_htf_bars)
 
     @staticmethod
     def _closed_htf_slice(
@@ -184,7 +196,9 @@ class LiveEngine:
                 log.info("%s: %d bars loaded (last %s)", symbol, len(frame),
                          pd.to_datetime(frame["time"].iloc[-1], unit="ms", utc=True))
             for htf_bs in self._htf_bar_sizes():
-                hframe = self._load_symbol_history(symbol, target_bar_size=htf_bs, need_bars=300)
+                hframe = self._load_symbol_history(
+                    symbol, target_bar_size=htf_bs, need_bars=self._htf_need_bars(htf_bs)
+                )
                 self.htf_buffers[(symbol, htf_bs)] = hframe
         for ctx_sym in self._context_symbols():
             cframe = self._load_symbol_history(ctx_sym)
@@ -193,12 +207,24 @@ class LiveEngine:
                 log.info("context %s: %d bars loaded", ctx_sym, len(cframe))
         for ctx_sym in self._htf_context_symbols():
             for htf_bs in self._htf_bar_sizes():
-                hcframe = self._load_symbol_history(ctx_sym, target_bar_size=htf_bs, need_bars=300)
+                hcframe = self._load_symbol_history(
+                    ctx_sym, target_bar_size=htf_bs, need_bars=self._htf_need_bars(htf_bs)
+                )
                 self.htf_context_buffers[(ctx_sym, htf_bs)] = hcframe
         latency = self.predictor.warmup(100)
         self.metrics.set_inference_latency(latency)
         log.info("model warm; last inference %.0f us", latency)
         account = self.client.metrics()
+        try:
+            init_pos = self.client.positions()
+            self._known_positions = {p.id: p for p in init_pos}
+        except Exception:  # noqa: BLE001
+            self._known_positions = {}
+        if hasattr(self.client, "fills"):
+            try:
+                self._seen_fill_ids = {f.id for f in self.client.fills(limit=50)}
+            except Exception:  # noqa: BLE001
+                self._seen_fill_ids = set()
         log.info(
             "account %s | %s | equity %.2f | positions %d | %s mode",
             account.account_id, "LIVE" if account.real_money else "DEMO",
@@ -228,6 +254,7 @@ class LiveEngine:
                 self.risk.on_account(account.equity)
                 self.metrics.set_equity(account.equity)
                 positions = self.client.positions()
+                self._reconcile_closed_positions(positions)
 
                 if now - self._last_settings_refresh >= self.config.refresh_settings_s:
                     self._refresh_settings(force=True)
@@ -280,8 +307,6 @@ class LiveEngine:
     # ----------------------------------------------------------------- one bar
     def _process_symbol(self, symbol: str, account, positions: list[Position]) -> None:
         bar = bar_ms(self.config.bar_size)
-        last_time = int(self.buffers[symbol]["time"].iloc[-1])
-        need_next = last_time + bar
 
         # ---- refresh the newest bars (the closed bar may not be in the buffer yet
         fresh = self.client.bars(symbol, self.config.bar_size, limit=2)
@@ -358,7 +383,22 @@ class LiveEngine:
                 )
 
         # ---- refresh causal higher-timeframe buffers for Hybrid Intraday Bias
-        ltf_close_ms = int(self.buffers[symbol]["time"].iloc[-1]) + bar
+        now_ms = int(self._clock() * 1000)
+        ltf_buf = self.buffers[symbol]
+        closed_ltf = ltf_buf[ltf_buf["time"] + bar <= now_ms]
+        if len(closed_ltf) >= self.config.lookback + 40:
+            ltf_buf = closed_ltf.reset_index(drop=True)
+        ltf_close_ms = int(ltf_buf["time"].iloc[-1]) + bar
+        ctx_arg: dict[str, pd.DataFrame] | None = None
+        if self.context_buffers:
+            ctx_arg = {}
+            for csym, cdf in self.context_buffers.items():
+                closed_c = cdf[cdf["time"] + bar <= now_ms]
+                ctx_arg[csym] = (
+                    closed_c.reset_index(drop=True)
+                    if len(closed_c) >= self.config.lookback + 40
+                    else cdf
+                )
         htf_bars_arg: dict[str, pd.DataFrame] | None = None
         htf_ctx_arg: dict[str, dict[str, pd.DataFrame]] | None = None
         active_htfs = self._htf_bar_sizes()
@@ -379,7 +419,7 @@ class LiveEngine:
                         merged_h.drop_duplicates("time", keep="last")
                         .sort_values("time")
                         .reset_index(drop=True)
-                        .tail(400)
+                        .tail(self._htf_need_bars(htf_bs) + 200)
                     )
                 closed_h = self._closed_htf_slice(
                     self.htf_buffers.get((symbol, htf_bs)), htf_bs, ltf_close_ms
@@ -402,7 +442,7 @@ class LiveEngine:
                             merged_hc.drop_duplicates("time", keep="last")
                             .sort_values("time")
                             .reset_index(drop=True)
-                            .tail(400)
+                            .tail(self._htf_need_bars(htf_bs) + 200)
                         )
                     closed_hc = self._closed_htf_slice(
                         self.htf_context_buffers.get((ctx_sym, htf_bs)), htf_bs, ltf_close_ms
@@ -414,9 +454,9 @@ class LiveEngine:
 
         # ---- features ------------------------------------------------------
         window = self.features.last_window(
-            self.buffers[symbol],
+            ltf_buf,
             self.config.lookback,
-            context=self.context_buffers if self.context_buffers else None,
+            context=ctx_arg,
             htf_bars=htf_bars_arg or None,
             htf_context=htf_ctx_arg or None,
         )
@@ -470,6 +510,7 @@ class LiveEngine:
                     "qty": p.qty,
                     "mark_price": p.mark_price or p.current_price or p.open_price,
                     "exposure": p.exposure,
+                    "open_time": p.open_time,
                 }
                 for p in positions
             ],
@@ -477,12 +518,12 @@ class LiveEngine:
             # Pass the clock explicitly: the macro blackout and the cooldown
             # compare against wall time, and defaulting to None silently used a
             # different time source than the rest of the loop.
-            now_ms=int(self._clock() * 1000),
+            now_ms=now_ms,
         )
 
         record = {
             "symbol": symbol,
-            "bar_time": int(self.buffers[symbol]["time"].iloc[-1]),
+            "bar_time": int(ltf_buf["time"].iloc[-1]),
             "mid": mid,
             "spread_bps": spread_bps,
             "atr": atr,
@@ -540,6 +581,7 @@ class LiveEngine:
             tp_dist = self.risk.config.tp_atr * tp_mult * atr
             tp_price = settings.round_price(mid + decision.intent.direction * tp_dist)
 
+        hold_mult = float(decision.meta.get("max_hold_mult", 1.0)) if decision.meta else 1.0
         result = self.router.open_position(
             symbol=symbol,
             intent=decision.intent.value,
@@ -547,11 +589,20 @@ class LiveEngine:
             stop_loss=verdict.stop_loss,
             take_profit=tp_price,
             reference_price=mid,
-            bar_time_ms=int(self.buffers[symbol]["time"].iloc[-1]),
+            bar_time_ms=int(ltf_buf["time"].iloc[-1]),
+            spread_bps=spread_bps,
         )
         record["execution"] = result.to_dict()
         if result.ok:
             self._last_trade_s = self._clock()
+            if not result.dry_run:
+                try:
+                    for p in self.client.positions():
+                        if p.id not in self._known_positions and p.symbol == symbol:
+                            self._position_hold_mult[p.id] = hold_mult
+                        self._known_positions[p.id] = p
+                except Exception:  # noqa: BLE001
+                    pass
             self.metrics.inc_trades(symbol)
             self.audit.write("trade_opened", **record)
             log.info(
@@ -575,7 +626,9 @@ class LiveEngine:
         pnl_price = side * (mid - pos.open_price)
 
         # time stop: a scalp that stops being a scalp is exited at breakeven-ish
-        if cfg.max_hold_bars and held_bars >= cfg.max_hold_bars:
+        hold_mult = self._position_hold_mult.get(pos.id, 1.0)
+        eff_max_hold = max(1, int(round(cfg.max_hold_bars * hold_mult))) if cfg.max_hold_bars else 0
+        if eff_max_hold and held_bars >= eff_max_hold:
             result = self.router.close_position(pos, reason=f"time stop {held_bars} bars")
             self._after_close(pos, result)
             return True
@@ -597,8 +650,24 @@ class LiveEngine:
             return True
         return False
 
-    def _after_close(self, pos: Position, result: ExecutionResult) -> None:
-        pnl = pos.upl
+    def _after_close(
+        self,
+        pos: Position,
+        result: ExecutionResult,
+        pnl_override: float | None = None,
+    ) -> None:
+        if not result.ok:
+            self.audit.write(
+                "close_failed",
+                position_id=pos.id,
+                symbol=pos.symbol,
+                error=result.error,
+                result=result.to_dict(),
+            )
+            return
+        self._known_positions.pop(pos.id, None)
+        self._position_hold_mult.pop(pos.id, None)
+        pnl = float(pnl_override if pnl_override is not None else pos.upl)
         self.risk.on_trade_closed(pnl)
         if pnl < 0:
             self._last_loss_s = self._clock()
@@ -606,8 +675,50 @@ class LiveEngine:
         self.audit.write(
             "trade_closed", position_id=pos.id, symbol=pos.symbol, pnl=pnl,
             side=pos.side, qty=pos.qty, open_price=pos.open_price,
-            current_price=pos.current_price, result=result.to_dict(),
+            current_price=result.price or pos.current_price, result=result.to_dict(),
         )
+
+    def _reconcile_closed_positions(self, current_positions: list[Position]) -> None:
+        """Detect positions closed server-side (SL / TP / liquidation / manual) between polls."""
+        current_by_id = {p.id: p for p in current_positions}
+        vanished = [
+            prev for pid, prev in self._known_positions.items() if pid not in current_by_id
+        ]
+        if vanished:
+            fills_by_sym: dict[str, list[Any]] = {}
+            if hasattr(self.client, "fills"):
+                for sym in {v.symbol for v in vanished}:
+                    try:
+                        fills_by_sym[sym] = list(self.client.fills(symbol=sym, limit=25))
+                    except Exception:  # noqa: BLE001
+                        fills_by_sym[sym] = []
+            for prev in vanished:
+                close_side = "SELL" if prev.side.upper() == "BUY" else "BUY"
+                matched_pnl: float | None = None
+                exit_px = prev.current_price
+                for f in sorted(fills_by_sym.get(prev.symbol, ()), key=lambda x: x.time):
+                    if f.id in self._seen_fill_ids:
+                        continue
+                    if f.side.upper() == close_side and f.time >= prev.open_time:
+                        self._seen_fill_ids.add(f.id)
+                        matched_pnl = (matched_pnl or 0.0) + float(f.rpl) - float(f.fee)
+                        exit_px = float(f.price or exit_px)
+                        if abs(f.qty - prev.qty) <= max(prev.qty * 0.05, 1e-9):
+                            break
+                realized_pnl = matched_pnl if matched_pnl is not None else float(prev.upl)
+                syn_res = ExecutionResult(
+                    ok=True,
+                    intent="EXCHANGE_CLOSE",
+                    symbol=prev.symbol,
+                    qty=prev.qty,
+                    price=exit_px,
+                )
+                log.info(
+                    "detected exchange close for position %s (%s %s) pnl=%.2f",
+                    prev.id, prev.side, prev.symbol, realized_pnl,
+                )
+                self._after_close(prev, syn_res, pnl_override=realized_pnl)
+        self._known_positions = current_by_id
 
     # ------------------------------------------------------- basket target
     def _check_basket_target(self, positions: list[Position]) -> bool:
@@ -659,12 +770,12 @@ class LiveEngine:
         return float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
 
     def _refresh_settings(self, force: bool = False) -> None:
-        if not force and time.time() - self._last_settings_refresh < self.config.refresh_settings_s:
+        if not force and self._clock() - self._last_settings_refresh < self.config.refresh_settings_s:
             return
         rows = self.client.settings(symbols=self.config.symbols)
         self.settings = {s.symbol: s for s in rows}
         self.router.settings.update(self.settings)
-        self._last_settings_refresh = time.time()
+        self._last_settings_refresh = self._clock()
         for symbol, s in self.settings.items():
             log.info(
                 "%s: minQty %s step %s | taker %.3f%% | maxLev %dx | hours %s",
@@ -677,7 +788,8 @@ class LiveEngine:
         try:
             positions = self.client.positions()
             for pos in positions:
-                self.router.close_position(pos, reason="kill switch")
+                res = self.router.close_position(pos, reason="kill switch")
+                self._after_close(pos, res)
         except Exception as exc:  # noqa: BLE001
             log.error("emergency flatten failed: %s", exc)
 

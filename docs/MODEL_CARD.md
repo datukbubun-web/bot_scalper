@@ -4,10 +4,10 @@
 
 | Field | Nilai |
 |---|---|
-| Nama | pxscalper supervised direction model (`tcn` / `lstm` / `gru` / `transformer`) |
-| Versi fitur | `fx-scalp-1.0.0` (38 fitur, lihat `features/pipeline.py::FEATURE_GROUPS`) |
+| Nama | pxscalper supervised direction & Hybrid MTF models (`tcn` / `lstm` / `gru` / `transformer`) |
+| Versi fitur | `fx-scalp-1.0.0` (38 fitur dasar; **83 fitur** pada `HYBRID_5M` & **74 fitur** pada `HYBRID_1M` dengan konteks + kalender + kausal MTF) |
 | Tugas | Klasifikasi 3 kelas: **turun (−1) / datar (0) / naik (+1)** atas return forward yang dinormalisasi ATR |
-| Input | Tensor `(1, 38, L)` dengan `L` default 64 bar (1 menit) |
+| Input | Tensor `(1, C, L)` dengan `L` default 64 bar (`C=83` pada `HYBRID_5M`, `C=74` pada `HYBRID_1M`) |
 | Output | Tiga probabilitas (softmax) + confidence; dikalibrasi dengan temperature scaling |
 | Horizon label | 5 bar ke depan, dead-band `0.15 × √horizon × ATR` |
 | Loss | Cross-entropy berbobot kelas + label smoothing 0.02 |

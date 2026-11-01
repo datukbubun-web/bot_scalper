@@ -15,7 +15,7 @@ profitable subset.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 # PnL can be reported two ways by a venue; both are supported explicitly so the

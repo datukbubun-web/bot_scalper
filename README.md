@@ -152,7 +152,7 @@ python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\ac
 pip install -e ".[train,test]"                        # PyTorch, ONNX Runtime, scikit-learn, pytest
 
 cp .env.example .env      # isi PX_API_KEY + PX_API_SECRET bila ingin konek ke PrimeXBT
-pytest -q                 # 246 test (unit, kausalitas MTF, risk, orderbook, live/backtest) — tanpa network
+pytest -q                 # 261 test (unit, kausalitas MTF, paritas train/serve, risk, orderbook, live/backtest) — tanpa network
 pxs smoke                 # uji mandiri end-to-end offline dengan data sintetis
 ```
 
@@ -316,7 +316,7 @@ src/pxscalper/
 configs/                    Preset produksi Hybrid ($10k 5M, $10k 1M, $100 Mini) & contoh riset
 scripts/training/           train_xau.py (pipeline Hybrid & single-TF XAU/USD), train_sl.py, train_rl.py
 scripts/                    export_models.py, calibrate.py, evaluate_real.py, xau_impact_ladder.py
-tests/                      246 test otomatis (tanpa koneksi jaringan & tanpa API key)
+tests/                      261 test otomatis (tanpa koneksi jaringan & tanpa API key)
 docs/                       XAUUSD_REPORT.md, MINI_ACCOUNT_100.md, MODEL_CARD.md, RUNBOOK.md, API_NOTES.md
 ```
 

@@ -41,7 +41,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -496,14 +495,39 @@ class FeatureEngineer:
         identical to the one used at training time, otherwise the model sees
         slightly different inputs live than in the backtest (train/serve skew).
         """
-        buffer = lookback + self.config.norm_window + 700
-        ctx_tail = (
-            {k: v.tail(buffer + 200) for k, v in context.items() if v is not None}
-            if context
-            else None
-        )
+        min_mtf_bars = 0
+        if getattr(self, "_mtf_cfg", None) is not None:
+            dt_ms = (
+                int(max(60_000, round(float(bars["time"].diff().median() or 60_000))))
+                if len(bars) >= 2 and "time" in bars.columns
+                else 60_000
+            )
+            bar_min = max(1.0, dt_ms / 60_000.0)
+            vol_base_bars = int(round(self._mtf_cfg.vol_baseline_minutes / bar_min))
+            vol_fast_bars = int(round(self._mtf_cfg.vol_fast_minutes / bar_min))
+            min_mtf_bars = vol_base_bars + vol_fast_bars + 200
+        buffer = max(lookback + self.config.norm_window + 700, lookback + min_mtf_bars)
+        bars_tail = bars.tail(buffer)
+        if context:
+            if len(bars_tail) and "time" in bars_tail.columns:
+                min_t = int(bars_tail["time"].iloc[0]) - 7 * 86_400_000
+                ctx_tail = {
+                    k: (
+                        v[v["time"] >= min_t]
+                        if "time" in v.columns
+                        else v.tail(buffer + 400)
+                    )
+                    for k, v in context.items()
+                    if v is not None
+                }
+            else:
+                ctx_tail = {
+                    k: v.tail(buffer + 400) for k, v in context.items() if v is not None
+                }
+        else:
+            ctx_tail = None
         normalized = self.transform_normalized(
-            bars.tail(buffer),
+            bars_tail,
             context=ctx_tail,
             htf_bars=htf_bars,
             htf_context=htf_context,

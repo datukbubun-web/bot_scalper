@@ -20,9 +20,7 @@ SAC (discrete) Christodoulou, "Soft Actor-Critic for Discrete Action Settings" (
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -406,10 +404,10 @@ class SACAgent:
                 tp.mul_(1 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
 
         return {
-            "critic_loss": float(critic_loss),
-            "actor_loss": float(actor_loss),
-            "alpha": float(self.alpha),
-            "q_mean": float(q1.mean()),
+            "critic_loss": float(critic_loss.detach()),
+            "actor_loss": float(actor_loss.detach()),
+            "alpha": float(self.alpha.detach()),
+            "q_mean": float(q1.detach().mean()),
         }
 
     def save(self, path) -> None:

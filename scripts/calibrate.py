@@ -22,14 +22,14 @@ from scipy.optimize import minimize_scalar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pxscalper.data.pipeline import DataPipeline  # noqa: E402
-from pxscalper.exchange.rest import PrimeXBTClient  # noqa: E402
-from pxscalper.features.labels import LabelConfig, volatility_scaled_labels  # noqa: E402
-from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer  # noqa: E402
-from pxscalper.inference.export import load_model_from_checkpoint  # noqa: E402
-from pxscalper.inference.predictor import Calibration  # noqa: E402
-from pxscalper.ops.backtest_runner import load_context_frames  # noqa: E402
-from pxscalper.utils import RepoPaths, setup_logging  # noqa: E402
+from pxscalper.data.pipeline import DataPipeline
+from pxscalper.exchange.rest import PrimeXBTClient
+from pxscalper.features.labels import LabelConfig, volatility_scaled_labels
+from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer
+from pxscalper.inference.export import load_model_from_checkpoint
+from pxscalper.inference.predictor import Calibration
+from pxscalper.ops.backtest_runner import load_context_frames, load_htf_frames
+from pxscalper.utils import RepoPaths, setup_logging
 
 
 def main() -> int:
@@ -59,7 +59,21 @@ def main() -> int:
     feat_json = model_dir / "features.json"
     engineer = FeatureEngineer(FeatureConfig.load(feat_json) if feat_json.exists() else FeatureConfig())
     context_map = load_context_frames(pipeline, engineer, bar_size=args.bars)
-    features = engineer.transform_normalized(bars, context=context_map)
+    htf_bars_map, htf_ctx_map = load_htf_frames(
+        pipeline, engineer, symbol=args.symbol, ltf_bar_size=args.bars
+    )
+    span_mins: list[int] = []
+    if context_map:
+        span_mins.extend(int(cf["time"].min()) for cf in context_map.values() if not cf.empty)
+    if htf_ctx_map:
+        for cmap in htf_ctx_map.values():
+            span_mins.extend(int(cf["time"].min()) for cf in cmap.values() if not cf.empty)
+    if span_mins:
+        bars = bars[bars["time"] >= max(span_mins)].reset_index(drop=True)
+
+    features = engineer.transform_normalized(
+        bars, context=context_map, htf_bars=htf_bars_map, htf_context=htf_ctx_map
+    )
     labels = volatility_scaled_labels(bars, LabelConfig(horizon=args.horizon))
     common = features.index.intersection(labels.index)
     model, mcfg = load_model_from_checkpoint(model_dir / f"{args.arch}.pt", args.arch)
@@ -77,6 +91,16 @@ def main() -> int:
         logits = model(xb).numpy()
     yb = y_all[lo:hi]
     mask = (yb >= 0) & (yb <= 2)
+    if getattr(mcfg, "antisymmetric_head", False):
+        # Antisymmetric gated models output exact [0, 0, 0] logits on quiet/gated bars;
+        # fit temperature strictly on active bars and cap T <= 1.05 so selective
+        # dislocation confidence is not crushed below threshold.
+        active = np.abs(logits).max(axis=1) > 1e-4
+        if int((mask & active).sum()) >= 10:
+            mask = mask & active
+        bounds = (0.5, 1.05)
+    else:
+        bounds = (0.2, 10.0)
     logits, yb = logits[mask], yb[mask]
 
     def nll(temperature: float) -> float:
@@ -86,7 +110,7 @@ def main() -> int:
         return float(-log_probs[np.arange(len(yb)), yb].mean())
 
     before = nll(1.0)
-    result = minimize_scalar(nll, bounds=(0.2, 10.0), method="bounded")
+    result = minimize_scalar(nll, bounds=bounds, method="bounded")
     after = float(result.fun)
     out = model_dir / "calibration.json"
     Calibration(

@@ -21,8 +21,7 @@ including its own bar; nothing is allowed to peek.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -142,11 +141,12 @@ class ScreenResult:
 
 def _two_sided_p(t: float, dof: int) -> float:
     """Normal approximation; exact enough for n in the thousands."""
+    from math import erfc, sqrt
+
     if dof <= 0:
         return 1.0
     z = abs(t)
-    # Abramowitz-Stegun style erfc via numpy
-    return float(np.math.erfc(z / np.sqrt(2.0))) if hasattr(np, "math") else 1.0
+    return float(erfc(z / sqrt(2.0)))
 
 
 def _p_from_t(t: float) -> float:

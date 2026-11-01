@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pxscalper"
 version = "0.1.0"
-description = "Institutional-grade FX scalping bot for PrimeXBT: TCN/LSTM/Transformer + PPO/SAC, TorchScript/ONNX low-latency inference."
+description = "Hybrid Intraday Bias + Scalper trading stack for PrimeXBT: Antisymmetric MTF Skip-TCN/LSTM/Transformer + PPO/SAC, TorchScript/ONNX low-latency inference."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -15,6 +15,8 @@ dependencies = [
   # runtime
   "numpy>=1.24",
   "pandas>=2.0",
+  "pyarrow>=14.0",            # Parquet bar cache (data/*.parquet)
+  "scipy>=1.11",              # calibration & statistical screening
   "PyYAML>=6.0",
   "cryptography>=42.0",       # Ed25519 request signing (PrimeXBT API v3)
   "requests>=2.31",

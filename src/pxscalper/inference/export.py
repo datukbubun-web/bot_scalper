@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import statistics
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -256,10 +255,39 @@ def export_all(
         model_config=cfg.to_dict(),
         latency_us=latency,
     )
+    manifest_file = out_dir / f"{arch}.manifest.json"
+    preserved_meta: dict = {}
+    if manifest_file.exists():
+        try:
+            old_m = json.loads(manifest_file.read_text(encoding="utf-8"))
+            for key in ("symbol", "bar_size", "architecture_mode"):
+                if old_m.get(key):
+                    preserved_meta[key] = old_m[key]
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        ckpt_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ckpt_meta = ckpt_payload.get("meta") or {}
+        for key in ("symbol", "bar_size", "architecture_mode"):
+            if key not in preserved_meta and ckpt_meta.get(key):
+                preserved_meta[key] = ckpt_meta[key]
+    except Exception:  # noqa: BLE001
+        pass
+    rep_file = out_dir / "training_report.json"
+    if rep_file.exists():
+        try:
+            rep = json.loads(rep_file.read_text(encoding="utf-8"))
+            for key in ("symbol", "bar_size", "architecture_mode"):
+                if key not in preserved_meta and rep.get(key):
+                    preserved_meta[key] = rep[key]
+        except Exception:  # noqa: BLE001
+            pass
+
     manifest_payload = result.to_dict()
     manifest_payload["torchscript_path"] = ts_path.name if ts_path else None
     manifest_payload["onnx_path"] = onnx_path.name if onnx_path else None
-    (out_dir / f"{arch}.manifest.json").write_text(
+    manifest_payload.update(preserved_meta)
+    manifest_file.write_text(
         json.dumps(manifest_payload, indent=2), encoding="utf-8"
     )
     log.info(

@@ -4,8 +4,9 @@
 
 ```bash
 pxs doctor          # secret valid? clock skew < 1s? akun DEMO/LIVE? simbol & jam trading?
-make test           # 68 test lulus
+make test           # 246+ test lulus (tanpa network & tanpa API key)
 make smoke          # pipeline end-to-end (sintetis, tanpa network)
+pxs bias            # cek Layer 1 Intraday Bias + Layer 2 Scalper Gate pada XAU/USD
 ```
 
 Jika `pxs doctor` menunjukkan `signed call → 403 NOT_PERMITTED`, key Anda `read` dan tidak bisa trading; buat key `trade`.
@@ -14,12 +15,12 @@ Jika `pxs doctor` menunjukkan `signed call → 403 NOT_PERMITTED`, key Anda `rea
 
 | Tahap | Perintah | Yang harus Anda lihat |
 |---|---|---|
-| 1. Data | `pxs data --bars 1M --limit 50000` | bar cukup, tanpa gap besar |
-| 2. Latih | `train_sl.py --arch tcn --export` | `val_acc_nonflat` > 0.52, `val_sharpe` > 0.5 |
-| 3. Kalibrasi | `scripts/calibrate.py` | `temperature` masuk akal (0.8–3.0), NLL turun |
-| 4. Backtest | `pxs backtest --config configs/live.example.yaml` | Sharpe > 0.5 **setelah** biaya, DD < 5%, trades > 200 |
-| 5. Paper | `pxs trade --config configs/live.example.yaml` | 3–7 hari, keputusan & eksekusi konsisten |
-| 6. Live kecil | `PX_LIVE_TRADING=1 pxs trade ... --i-understand-the-risk` | dengan `risk_per_trade_pct` 0.1–0.25 |
+| 1. Data | `pxs data --symbols "XAU/USD,XAG/USD" --bars 5M --limit 25000` | bar cukup, tanpa gap besar |
+| 2. Latih Hybrid | `python3 scripts/training/train_xau.py --bars ALL` | OOS `Sharpe > +2.5`, `PF > 1.5`, lulus stress 2x biaya |
+| 3. Kalibrasi | `python3 scripts/calibrate.py` | `temperature` masuk akal (`0.8–1.05` untuk Skip-TCN), NLL stabil |
+| 4. Backtest OOS | `pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40` | Sharpe positif **setelah** biaya, DD terkendali |
+| 5. Paper | `pxs trade --config configs/live.hybrid.yaml` | 3–7 hari, keputusan Bias + eksekusi konsisten |
+| 6. Live kecil | `PX_LIVE_TRADING=1 pxs trade --config configs/live.mini100.hybrid.yaml --i-understand-the-risk` | mulai kecil (`risk_per_trade_pct` 0.25–0.5) |
 
 Jangan lompat tahap. Mock execution di paper memakai `impact` yang sama dengan live, jadi selisih paper→live seharusnya hanya slippage.
 

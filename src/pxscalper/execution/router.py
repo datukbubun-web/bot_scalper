@@ -109,11 +109,21 @@ class OrderRouter:
         take_profit: float | None,
         reference_price: float,
         bar_time_ms: int = 0,
+        spread_bps: float = 0.0,
     ) -> ExecutionResult:
         """Market (or passive limit) entry with protection attached."""
         started = time.perf_counter()
         side = "BUY" if intent.upper() in ("LONG", "BUY") else "SELL"
         settings = self.settings.get(symbol)
+        if self.config.max_spread_bps > 0 and spread_bps > self.config.max_spread_bps:
+            return self._fail(
+                intent,
+                symbol,
+                qty,
+                reference_price,
+                f"spread {spread_bps:.2f}bps beyond max_spread_bps {self.config.max_spread_bps:.2f}bps",
+                started,
+            )
         if qty <= 0 or (settings and qty + 1e-12 < settings.min_qty):
             return self._fail(
                 intent, symbol, qty, reference_price,

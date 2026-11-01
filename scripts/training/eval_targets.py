@@ -31,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from pxscalper.data.pipeline import DataPipeline  # noqa: E402
 from pxscalper.exchange.rest import PrimeXBTClient  # noqa: E402
-from pxscalper.features.labels import LabelConfig, volatility_scaled_labels  # noqa: E402
 from pxscalper.features.pipeline import FeatureConfig, FeatureEngineer  # noqa: E402
 from pxscalper.features.targets import (  # noqa: E402
     BarrierConfig,

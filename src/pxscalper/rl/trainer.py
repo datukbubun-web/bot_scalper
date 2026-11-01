@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from .agents import (
     ActorCriticConfig,
@@ -18,7 +17,7 @@ from .agents import (
     SACAgent,
     SACConfig,
 )
-from .env import EnvConfig, FXScalpEnv
+from .env import FXScalpEnv
 
 log = logging.getLogger(__name__)
 
