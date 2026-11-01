@@ -17,16 +17,34 @@ lookback: 64
 horizon: 12
 
 inference:
+  arch: "tcn"
+  version: "latest"
+  model_dir: "artifacts/xau_hybrid_5M"
   backend: "onnx"
   confidence_threshold: 0.45
   edge_threshold: 0.03
 
 strategy:
-  kind: "probabilistic"
+  kind: "hybrid"
   min_confidence: 0.45
   min_edge: 0.03
   allow_flat: true
   size_by_edge: false
+
+hybrid:
+  enabled: true
+  require_composite_threshold: true
+  composite_threshold: 1.85
+  bias:
+    htf_bar_size: "15M"
+    htf_rv_col: "htf_15m_xag_rv_z_2"
+    ltf_rv_col: "ctx_xag_rv_z_4"
+    ltf_weight: 0.65
+    htf_weight: 0.35
+    max_opposing_session_trend: 0.60
+    max_vol_regime_ratio: 1.85
+    min_vol_regime_ratio: 0.15
+    require_htf_non_opposing: true
 
 risk:
   single_symbol: true

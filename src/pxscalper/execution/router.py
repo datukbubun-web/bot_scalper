@@ -130,20 +130,30 @@ class OrderRouter:
                 f"qty {qty} below minimum {settings.min_qty if settings else 0.0}",
                 started,
             )
-        qty = settings.round_qty(qty) if settings else qty
+        qty = settings.floor_qty(qty) if settings else qty
+        if qty <= 0 or (settings and qty + 1e-12 < settings.min_qty):
+            return self._fail(
+                intent, symbol, qty, reference_price,
+                f"floored qty {qty} below minimum {settings.min_qty if settings else 0.0}",
+                started,
+            )
         cid = make_client_order_id(symbol, bar_time_ms or int(time.time() * 1000), intent)
 
-        if stop_loss is not None and stop_loss > 0 and settings:
-            stop_loss = settings.round_price(stop_loss)
-        if take_profit is not None and take_profit > 0 and settings:
-            take_profit = settings.round_price(take_profit)
+        if not self.config.attach_protection:
+            stop_loss = None
+            take_profit = None
+        else:
+            if stop_loss is not None and stop_loss > 0 and settings:
+                stop_loss = settings.round_price(stop_loss)
+            if take_profit is not None and take_profit > 0 and settings:
+                take_profit = settings.round_price(take_profit)
 
-        # Snapshot pre-existing positions so post-trade verification detects
-        # the NEW fill (in HEDGE mode) or increased size (in NETTING mode),
-        # rather than falsely matching position #1 on scaled entries #2..#10.
+        # Snapshot pre-existing positions so post-trade verification & timeout
+        # reconciliation detect a NEW fill (HEDGE mode) or increased size
+        # (NETTING mode), rather than falsely matching an older open position.
         pre_ids: set[int | str] = set()
         pre_side_qty = 0.0
-        if not self.config.dry_run and self.config.verify_fills and self.config.verify_timeout_s > 0:
+        if not self.config.dry_run:
             try:
                 existing = [p for p in self.client.positions() if p.symbol == symbol]
                 pre_ids = {p.id for p in existing}
@@ -193,27 +203,38 @@ class OrderRouter:
                     symbol, side, qty, take_profit, stop_loss, cid
                 )
         except ApiError as exc:
-            if exc.code in ("POSITION_NOT_FOUND", "ORDER_NOT_FOUND"):
-                return self._fail(intent, symbol, qty, reference_price, str(exc), started, cost)
-            # network / timeout: the order may or may not exist -> reconcile
+            if 400 <= int(getattr(exc, "status", 0) or 0) < 500 or exc.code in (
+                "POSITION_NOT_FOUND",
+                "ORDER_NOT_FOUND",
+            ):
+                return self._fail(
+                    intent, symbol, qty, reference_price, f"placement failed: {exc}", started, cost
+                )
+            # 5xx / gateway error: the order may have executed -> reconcile
             log.error("placement uncertain for %s (%s); reconciling", cid, exc)
-            found = self._find_by_client_id(cid)
+            found = self._reconcile_ambiguous_entry(
+                cid=cid, symbol=symbol, side=side, pre_ids=pre_ids, pre_side_qty=pre_side_qty
+            )
             if found:
                 return ExecutionResult(
-                    ok=True, intent=intent, symbol=symbol, qty=qty,
-                    price=found.get("executedPrice") or cost.price,
+                    ok=True, intent=intent, symbol=symbol,
+                    qty=float(found.get("qty") or qty),
+                    price=float(found.get("executedPrice") or cost.price),
                     order_id=found.get("id"), client_order_id=cid,
                     stop_loss=stop_loss, take_profit=take_profit, cost=asdict(cost),
                     latency_ms=(time.perf_counter() - started) * 1000,
                 )
             return self._fail(intent, symbol, qty, reference_price, f"placement failed: {exc}", started, cost)
         except Exception as exc:  # noqa: BLE001 -- sockets, TLS, DNS
-            log.error("placement ambiguous (%s); reconciling by clientOrderId", exc)
-            found = self._find_by_client_id(cid)
+            log.error("placement ambiguous (%s); reconciling order & position state", exc)
+            found = self._reconcile_ambiguous_entry(
+                cid=cid, symbol=symbol, side=side, pre_ids=pre_ids, pre_side_qty=pre_side_qty
+            )
             if found:
                 return ExecutionResult(
-                    ok=True, intent=intent, symbol=symbol, qty=qty,
-                    price=found.get("executedPrice") or cost.price,
+                    ok=True, intent=intent, symbol=symbol,
+                    qty=float(found.get("qty") or qty),
+                    price=float(found.get("executedPrice") or cost.price),
                     order_id=found.get("id"), client_order_id=cid,
                     stop_loss=stop_loss, take_profit=take_profit, cost=asdict(cost),
                     latency_ms=(time.perf_counter() - started) * 1000,
@@ -248,9 +269,20 @@ class OrderRouter:
 
     def close_position(self, position: Position, reason: str = "") -> ExecutionResult:
         started = time.perf_counter()
+        if self.config.dry_run:
+            log.info(
+                "[dry-run] close position %s (%s) pnl %.2f %s",
+                position.id, position.symbol, position.upl, reason,
+            )
+            return ExecutionResult(
+                ok=True, intent="CLOSE", symbol=position.symbol, qty=position.qty,
+                price=position.current_price,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                dry_run=True,
+            )
         try:
             self.client.close_position(position.id)
-        except ApiError as exc:
+        except Exception as exc:  # noqa: BLE001
             return ExecutionResult(
                 ok=False, intent="CLOSE", symbol=position.symbol, qty=position.qty,
                 price=position.current_price, error=str(exc),
@@ -265,17 +297,23 @@ class OrderRouter:
         )
 
     def close_all(self) -> None:
+        if self.config.dry_run:
+            log.info("[dry-run] close_all skipped in dry-run mode")
+            return
         try:
             self.client.close_all_positions()
-        except ApiError as exc:
+        except Exception as exc:  # noqa: BLE001
             log.error("close_all failed: %s", exc)
 
     def tighten_stop(self, position: Position, new_stop: float) -> bool:
         """Trailing-stop update. Replacing protection is a trade-permission route."""
+        if self.config.dry_run:
+            log.info("[dry-run] tighten_stop %s -> %.6f", position.id, new_stop)
+            return True
         try:
             self.client.set_protective(position.id, "STOP_LOSS", new_stop)
             return True
-        except ApiError as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("could not move stop on %s: %s", position.id, exc)
             return False
 
@@ -290,7 +328,7 @@ class OrderRouter:
     ) -> Position | None:
         excluded = exclude_ids or set()
         deadline = time.time() + timeout_s
-        while time.time() < deadline:
+        while True:
             try:
                 same_sym = [p for p in self.client.positions() if p.symbol == symbol]
                 # 1. HEDGE / fresh entry: brand-new position ID matching side
@@ -298,19 +336,21 @@ class OrderRouter:
                     if pos.id not in excluded and (side is None or pos.side.upper() == side.upper()):
                         return pos
                 # 2. NETTING entry: existing same-side position whose qty increased
-                if excluded and side is not None:
+                if side is not None:
                     side_positions = [p for p in same_sym if p.side.upper() == side.upper()]
                     total_side_qty = sum(p.qty for p in side_positions)
                     if side_positions and total_side_qty > min_side_qty + 1e-12:
                         return side_positions[-1]
-            except ApiError as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.warning("positions poll failed: %s", exc)
+            if time.time() >= deadline:
+                break
             time.sleep(poll_s)
         return None
 
     # ----------------------------------------------------------------- private
     def _find_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
-        """Reconciliation after an ambiguous write: did our order actually land?"""
+        """Reconciliation after an ambiguous write: did a resting order land?"""
         try:
             for order in self.client.active_orders():
                 if order.client_order_id == client_order_id:
@@ -318,8 +358,65 @@ class OrderRouter:
                         "id": order.id,
                         "executedPrice": order.executed_price,
                     }
-        except ApiError as exc:
+        except Exception as exc:  # noqa: BLE001
             log.warning("reconcile: orders/active unavailable (%s)", exc)
+        return None
+
+    def _reconcile_ambiguous_entry(
+        self,
+        *,
+        cid: str,
+        symbol: str,
+        side: str,
+        pre_ids: set[int | str],
+        pre_side_qty: float,
+    ) -> dict[str, Any] | None:
+        """Check active_orders, fills, and positions after an ambiguous write timeout.
+
+        Market orders fill immediately and disappear from ``active_orders()``;
+        checking only ``active_orders()`` would falsely conclude the order never
+        landed and allow a duplicate market order on the next cycle.
+        """
+        found = self._find_by_client_id(cid)
+        if found:
+            return found
+
+        if hasattr(self.client, "fills"):
+            try:
+                for fill in self.client.fills(symbol=symbol, limit=15):
+                    if getattr(fill, "client_order_id", None) == cid:
+                        return {
+                            "id": getattr(fill, "order_id", None),
+                            "executedPrice": getattr(fill, "price", None),
+                            "qty": getattr(fill, "qty", None),
+                        }
+            except Exception as exc:  # noqa: BLE001
+                log.warning("reconcile: fills unavailable (%s)", exc)
+
+        timeout_s = (
+            min(self.config.verify_timeout_s, 1.5)
+            if (self.config.verify_fills and self.config.verify_timeout_s > 0)
+            else 0.0
+        )
+        pos = self.wait_for_position(
+            symbol,
+            timeout_s=timeout_s,
+            poll_s=0.2,
+            exclude_ids=pre_ids,
+            side=side,
+            min_side_qty=pre_side_qty,
+        )
+        if pos is not None:
+            delta_qty = (
+                pos.qty - pre_side_qty
+                if pos.id in pre_ids and pos.qty > pre_side_qty
+                else pos.qty
+            )
+            return {
+                "id": pos.id,
+                "executedPrice": pos.open_price,
+                "qty": delta_qty,
+            }
         return None
 
     @staticmethod

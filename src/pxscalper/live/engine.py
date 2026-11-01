@@ -21,9 +21,11 @@ metrics survive restarts, and every decision carries the reason it was taken.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -32,10 +34,10 @@ import pandas as pd
 from ..exchange.models import Position, SymbolSettings
 from ..exchange.rest import ApiError, PrimeXBTClient
 from ..execution.router import ExecutionResult, OrderRouter
-from ..features.pipeline import FeatureEngineer, FeatureConfig
+from ..features.pipeline import FeatureConfig, FeatureEngineer
 from ..inference.predictor import Predictor
 from ..risk.basket import BasketTarget
-from ..risk.engine import RiskEngine
+from ..risk.engine import RiskEngine, pnl_coefficient
 from ..strategy.decision import ScalpingStrategy
 from ..utils import JsonlLogger, bar_ms
 from .metrics import Metrics
@@ -114,6 +116,9 @@ class LiveEngine:
         self._last_decision_time: dict[str, int] = {}
         self._last_l2_probe: dict[str, float] = {}
         self._known_positions: dict[int | str, Position] = {}
+        self._paper_positions: dict[int | str, Position] = {}
+        self._next_paper_id: int = 900_000
+        self._last_journal_sig: tuple[Any, ...] | None = None
         self._seen_fill_ids: set[int] = set()
         self._position_hold_mult: dict[int | str, float] = {}
         self._last_trade_s = 0.0
@@ -127,6 +132,106 @@ class LiveEngine:
             clock=self._clock,
         )
         self._consecutive_errors = 0
+
+    def _is_dry_run(self) -> bool:
+        return bool(getattr(getattr(self.router, "config", None), "dry_run", False))
+
+    def _managed_positions(self, positions: list[Position]) -> list[Position]:
+        allowed = set(self.config.symbols)
+        return [p for p in positions if p.symbol in allowed]
+
+    def _sync_position_journal(self, positions: list[Position]) -> None:
+        if self._is_dry_run() or not self.config.state_path:
+            return
+        managed = self._managed_positions(positions)
+        sig = tuple(
+            sorted(
+                (str(p.id), p.symbol, p.side, float(p.qty), p.stop_loss_price, p.take_profit_price)
+                for p in managed
+            )
+        )
+        if sig == self._last_journal_sig:
+            return
+        self._last_journal_sig = sig
+        try:
+            path = Path(self.config.state_path)
+            existing: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text()).get("positions", {}) or {}
+                except Exception:  # noqa: BLE001
+                    existing = {}
+            allowed = set(self.config.symbols)
+            kept = {
+                pid: info
+                for pid, info in existing.items()
+                if info.get("symbol") not in allowed
+            }
+            for p in managed:
+                kept[str(p.id)] = {
+                    "symbol": p.symbol,
+                    "side": p.side,
+                    "qty": p.qty,
+                    "open_price": p.open_price,
+                    "open_time": p.open_time,
+                    "stop_loss_price": p.stop_loss_price,
+                    "take_profit_price": p.take_profit_price,
+                    "source": "live_engine",
+                }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"positions": kept}, indent=2))
+            tmp.replace(path)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("position journal sync skipped: %s", exc)
+
+    def _update_paper_positions(
+        self, symbol: str, bid: float, ask: float, mid: float
+    ) -> bool:
+        """Mark paper positions to market and trigger simulated SL/TP exits."""
+        if not self._paper_positions:
+            return False
+        closed_any = False
+        try:
+            coeff = pnl_coefficient(symbol, mid)
+        except ValueError:
+            coeff = 1.0
+        for pid, pos in list(self._paper_positions.items()):
+            if pos.symbol != symbol:
+                continue
+            side = 1 if pos.side.upper() in ("BUY", "LONG") else -1
+            exit_px = bid if side > 0 else ask
+            pos.current_price = exit_px
+            pos.mark_price = mid
+            pos.exposure = abs(pos.qty * mid * coeff)
+            pos.upl = side * (exit_px - pos.open_price) * pos.qty * coeff
+            sl = pos.stop_loss_price
+            tp = pos.take_profit_price
+            hit_reason = ""
+            fill_px = exit_px
+            if sl is not None and ((side > 0 and bid <= sl) or (side < 0 and ask >= sl)):
+                hit_reason = "paper stop_loss"
+                fill_px = sl
+            elif tp is not None and ((side > 0 and bid >= tp) or (side < 0 and ask <= tp)):
+                hit_reason = "paper take_profit"
+                fill_px = tp
+            if hit_reason:
+                realized = side * (fill_px - pos.open_price) * pos.qty * coeff
+                res = ExecutionResult(
+                    ok=True,
+                    intent="PAPER_SL_TP",
+                    symbol=symbol,
+                    qty=pos.qty,
+                    price=fill_px,
+                    dry_run=True,
+                )
+                log.info(
+                    "[dry-run] %s hit on paper position %s (%s %s) pnl=%.2f",
+                    hit_reason, pid, pos.side, symbol, realized,
+                )
+                self._after_close(pos, res, pnl_override=realized)
+                closed_any = True
+        return closed_any
 
     def _context_symbols(self) -> list[str]:
         if getattr(self.features, "_context_cfg", None) is not None:
@@ -218,9 +323,11 @@ class LiveEngine:
         self.metrics.set_inference_latency(latency)
         log.info("model warm; last inference %.0f us", latency)
         account = self.client.metrics()
+        self.risk.on_account(account.equity)
         try:
-            init_pos = self.client.positions()
+            init_pos = self._managed_positions(self.client.positions())
             self._known_positions = {p.id: p for p in init_pos}
+            self._sync_position_journal(init_pos)
         except Exception:  # noqa: BLE001
             self._known_positions = {}
         if hasattr(self.client, "fills"):
@@ -254,29 +361,58 @@ class LiveEngine:
                 current_bar = int(now * 1000) // bar * bar
 
                 account = self.client.metrics()
-                self.risk.on_account(account.equity)
-                self.metrics.set_equity(account.equity)
-                positions = self.client.positions()
-                self._reconcile_closed_positions(positions)
+                if self._is_dry_run():
+                    positions = list(self._paper_positions.values())
+                    managed = positions
+                    eff_equity = (
+                        account.equity
+                        + self.risk.state.realised_pnl_today
+                        + sum(p.upl for p in positions)
+                    )
+                    self.risk.on_account(eff_equity)
+                    self.metrics.set_equity(eff_equity)
+                else:
+                    eff_equity = account.equity
+                    self.risk.on_account(account.equity)
+                    self.metrics.set_equity(account.equity)
+                    positions = self.client.positions()
+                    managed = self._managed_positions(positions)
+                    self._reconcile_closed_positions(managed)
+                    self._sync_position_journal(managed)
 
                 if now - self._last_settings_refresh >= self.config.refresh_settings_s:
                     self._refresh_settings(force=True)
 
                 # Basket target & daily compounding profit harvest are checked every cycle:
                 # profit can peak between bars and locking in the target is why these exist.
-                if self._check_daily_profit_harvest(positions, equity=account.equity):
-                    positions = self.client.positions()
-                elif self._check_basket_target(positions, equity=account.equity):
-                    positions = self.client.positions()
+                harvested = False
+                if self._check_daily_profit_harvest(managed, equity=eff_equity):
+                    harvested = True
+                elif self._check_basket_target(managed, equity=eff_equity):
+                    harvested = True
 
-                for symbol in self.config.symbols:
-                    if last_bar_time.get(symbol) == current_bar:
-                        continue
-                    if int(now * 1000) - current_bar < self.config.settle_ms:
-                        continue  # bar just opened; wait for the feed to settle
-                    last_bar_time[symbol] = current_bar
-                    self._process_symbol(symbol, account, positions)
-                    processed += 1
+                if harvested:
+                    self._last_trade_s = self._clock()
+                    if not self._is_dry_run():
+                        account = self.client.metrics()
+                        self.risk.on_account(account.equity)
+                        positions = self.client.positions()
+                        self._sync_position_journal(self._managed_positions(positions))
+                    else:
+                        positions = list(self._paper_positions.values())
+                    for symbol in self.config.symbols:
+                        if last_bar_time.get(symbol) != current_bar:
+                            last_bar_time[symbol] = current_bar
+                            processed += 1
+                else:
+                    for symbol in self.config.symbols:
+                        if last_bar_time.get(symbol) == current_bar:
+                            continue
+                        if int(now * 1000) - current_bar < self.config.settle_ms:
+                            continue  # bar just opened; wait for the feed to settle
+                        last_bar_time[symbol] = current_bar
+                        self._process_symbol(symbol, account, positions)
+                        processed += 1
 
                 self.metrics.observe_cycle((time.perf_counter() - cycle_start) * 1000)
                 self._consecutive_errors = 0
@@ -359,6 +495,16 @@ class LiveEngine:
             return
 
         # ---- position management first: exits outrank entries --------------
+        if self._is_dry_run() and self._paper_positions:
+            if self._update_paper_positions(symbol, quote.bid, quote.ask, mid):
+                positions[:] = list(self._paper_positions.values())
+                return  # paper SL/TP closed a position this bar; do not re-enter on the same bar
+            if positions is not None:
+                # keep caller's list synced if this came from run()
+                paper_ids = set(self._paper_positions)
+                if all(p.id in paper_ids for p in positions):
+                    positions[:] = list(self._paper_positions.values())
+
         symbol_positions = [p for p in positions if p.symbol == symbol]
         atr = self._atr(symbol)
         closed_any = False
@@ -565,18 +711,76 @@ class LiveEngine:
             want_buy = decision.intent.direction > 0
             opposite_positions = [
                 p for p in symbol_positions
-                if (want_buy and p.side.upper() == "SELL")
-                or (not want_buy and p.side.upper() == "BUY")
+                if (want_buy and p.side.upper() in ("SELL", "SHORT"))
+                or (not want_buy and p.side.upper() in ("BUY", "LONG"))
             ]
-            for opp in opposite_positions:
-                close_res = self.router.close_position(opp, reason="reverse before opposite entry")
-                self._after_close(opp, close_res)
-                if not close_res.ok:
-                    log.error(
-                        "%s: aborting reversal entry because closing opposite position %s failed: %s",
-                        symbol, opp.id, close_res.error,
+            if opposite_positions:
+                for opp in opposite_positions:
+                    close_res = self.router.close_position(opp, reason="reverse before opposite entry")
+                    self._after_close(opp, close_res)
+                    if not close_res.ok:
+                        log.error(
+                            "%s: aborting reversal entry because closing opposite position %s failed: %s",
+                            symbol, opp.id, close_res.error,
+                        )
+                        self.audit.write("trade_failed", reason="opposite close failed", **record)
+                        return
+                # Re-evaluate risk on post-close equity & surviving positions so a
+                # reversal cannot bypass a newly triggered cooldown / daily loss limit
+                # and sizes off actual realized equity.
+                if self._is_dry_run():
+                    positions[:] = list(self._paper_positions.values())
+                    post_eq = (
+                        account.equity
+                        + self.risk.state.realised_pnl_today
+                        + sum(p.upl for p in positions)
                     )
-                    self.audit.write("trade_failed", reason="opposite close failed", **record)
+                else:
+                    try:
+                        account = self.client.metrics()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    post_eq = account.equity
+                    try:
+                        positions[:] = self.client.positions()
+                    except Exception:  # noqa: BLE001
+                        positions[:] = [p for p in positions if p not in opposite_positions]
+                verdict = self.risk.evaluate(
+                    symbol=symbol,
+                    direction=decision.intent.direction,
+                    confidence=decision.confidence,
+                    edge=decision.edge,
+                    price=mid,
+                    equity=post_eq,
+                    atr=atr,
+                    spread_bps=spread_bps,
+                    market_open=quote.market_open,
+                    min_qty=settings.min_qty,
+                    qty_step=settings.qty_step,
+                    price_step=settings.min_price_step,
+                    open_positions=[
+                        {
+                            "symbol": p.symbol,
+                            "side": p.side,
+                            "qty": p.qty,
+                            "mark_price": p.mark_price or p.current_price or p.open_price,
+                            "exposure": p.exposure,
+                            "open_time": p.open_time,
+                        }
+                        for p in positions
+                    ],
+                    gross_exposure=sum((p.exposure or 0.0) for p in positions),
+                    now_ms=now_ms,
+                )
+                record["risk_post_reversal_close"] = verdict.to_dict()
+                if not verdict.allowed:
+                    log.info("%s | post-reversal risk veto: %s", symbol, verdict.reason)
+                    self.audit.write("no_trade", reason=f"post-reversal: {verdict.reason}", **record)
+                    return
+                qty = settings.floor_qty(verdict.qty * decision.size_multiplier)
+                if qty < settings.min_qty:
+                    log.info("%s: post-reversal qty %.8f below min, skipping", symbol, qty)
+                    self.audit.write("no_trade", reason="post-reversal qty below min", **record)
                     return
 
         tp_price = verdict.take_profit
@@ -599,12 +803,43 @@ class LiveEngine:
         record["execution"] = result.to_dict()
         if result.ok:
             self._last_trade_s = self._clock()
-            if not result.dry_run:
+            if result.dry_run:
+                self._next_paper_id += 1
+                pid = self._next_paper_id
+                side_str = "BUY" if decision.intent.direction > 0 else "SELL"
                 try:
-                    for p in self.client.positions():
+                    coeff = pnl_coefficient(symbol, result.price or mid)
+                except ValueError:
+                    coeff = 1.0
+                paper_pos = Position(
+                    id=pid,
+                    symbol=symbol,
+                    side=side_str,
+                    qty=result.qty,
+                    open_price=result.price or mid,
+                    current_price=result.price or mid,
+                    mark_price=mid,
+                    upl=0.0,
+                    roe_pct=0.0,
+                    liq_price=None,
+                    margin=0.0,
+                    client_leverage=self.risk.config.max_leverage,
+                    stop_loss_price=result.stop_loss,
+                    take_profit_price=result.take_profit,
+                    open_time=int(self._clock() * 1000),
+                    exposure=abs(result.qty * (result.price or mid) * coeff),
+                )
+                self._paper_positions[pid] = paper_pos
+                self._position_hold_mult[pid] = hold_mult
+                positions.append(paper_pos)
+            else:
+                try:
+                    live_managed = self._managed_positions(self.client.positions())
+                    for p in live_managed:
                         if p.id not in self._known_positions and p.symbol == symbol:
                             self._position_hold_mult[p.id] = hold_mult
                         self._known_positions[p.id] = p
+                    self._sync_position_journal(live_managed)
                 except Exception:  # noqa: BLE001
                     pass
             self.metrics.inc_trades(symbol)
@@ -644,7 +879,9 @@ class LiveEngine:
                 side < 0 and trail < pos.stop_loss_price
             )
             if improves:
-                self.router.tighten_stop(pos, self.settings[symbol].round_price(trail))
+                new_stop = self.settings[symbol].round_price(trail)
+                if self.router.tighten_stop(pos, new_stop):
+                    pos.stop_loss_price = new_stop
 
         # emergency: unrealised loss beyond 1.5x the intended stop (feed gap / slippage)
         if atr > 0 and pnl_price < -1.5 * self.risk.config.sl_atr * atr:
@@ -670,6 +907,7 @@ class LiveEngine:
             )
             return
         self._known_positions.pop(pos.id, None)
+        self._paper_positions.pop(pos.id, None)
         self._position_hold_mult.pop(pos.id, None)
         pnl = float(pnl_override if pnl_override is not None else pos.upl)
         self.risk.on_trade_closed(pnl)
@@ -684,7 +922,8 @@ class LiveEngine:
 
     def _reconcile_closed_positions(self, current_positions: list[Position]) -> None:
         """Detect positions closed server-side (SL / TP / liquidation / manual) between polls."""
-        current_by_id = {p.id: p for p in current_positions}
+        managed_current = self._managed_positions(current_positions)
+        current_by_id = {p.id: p for p in managed_current}
         vanished = [
             prev for pid, prev in self._known_positions.items() if pid not in current_by_id
         ]
@@ -727,10 +966,11 @@ class LiveEngine:
     # ------------------------------------------------------- basket & daily harvest
     def _check_daily_profit_harvest(self, positions: list[Position], equity: float = 0.0) -> bool:
         """Close all open positions once total daily equity gain hits daily_profit_target_pct."""
+        managed = self._managed_positions(positions)
         target_pct = self.risk.config.daily_profit_target_pct
         day_start = self.risk.state.day_start_equity
         if (
-            not positions
+            not managed
             or not self.config.harvest_daily_profit_target
             or target_pct <= 0
             or day_start <= 0
@@ -742,7 +982,7 @@ class LiveEngine:
             return False
         log.warning(
             "DAILY PROFIT TARGET HIT +%.2f%% >= +%.2f%% (day_start=%.2f, equity=%.2f) -> harvesting %d position(s)",
-            day_gain_pct, target_pct, day_start, equity, len(positions),
+            day_gain_pct, target_pct, day_start, equity, len(managed),
         )
         self.audit.write(
             "daily_profit_target_hit",
@@ -750,10 +990,10 @@ class LiveEngine:
             target_pct=target_pct,
             day_start_equity=day_start,
             equity=equity,
-            positions=len(positions),
+            positions=len(managed),
         )
         closed = 0
-        for pos in positions:
+        for pos in managed:
             result = self.router.close_position(pos, reason=f"daily profit target +{target_pct:g}%")
             self._after_close(pos, result)
             if result.ok:
@@ -761,7 +1001,12 @@ class LiveEngine:
             else:
                 log.error("daily harvest close failed for %s: %s", pos.id, result.error)
                 return False
-        return closed > 0
+        if closed > 0:
+            self.risk.latch_daily_profit_target(
+                f"harvested {closed} position(s) at +{day_gain_pct:.2f}% >= +{target_pct:g}%"
+            )
+            return True
+        return False
 
     def _check_basket_target(self, positions: list[Position], equity: float = 0.0) -> bool:
         """Close every position when the combined PnL reaches the target.
@@ -771,10 +1016,11 @@ class LiveEngine:
         per-position audit trail, and an audit trail is the only way to explain
         afterwards why a losing leg was closed.
         """
-        if not positions or self._basket.effective_target(equity) <= 0:
+        managed = self._managed_positions(positions)
+        if not managed or self._basket.effective_target(equity) <= 0:
             return False
         verdict = self._basket.evaluate(
-            positions, enforce=self.config.close_all_enforce, equity=equity
+            managed, enforce=self.config.close_all_enforce, equity=equity
         )
         if verdict.triggered and not self.config.close_all_enforce:
             self.audit.write("basket_target_report_only", **verdict.to_dict())
@@ -785,7 +1031,7 @@ class LiveEngine:
         log.warning("%s", verdict.reason)
         self.audit.write("basket_target_hit", **verdict.to_dict())
         closed = 0
-        for pos in positions:
+        for pos in managed:
             result = self.router.close_position(pos, reason="basket profit target")
             self._after_close(pos, result)
             if result.ok:
@@ -828,10 +1074,16 @@ class LiveEngine:
 
     def _emergency_flatten(self) -> None:
         try:
-            positions = self.client.positions()
+            positions = (
+                list(self._paper_positions.values())
+                if self._is_dry_run()
+                else self._managed_positions(self.client.positions())
+            )
             for pos in positions:
                 res = self.router.close_position(pos, reason="kill switch")
                 self._after_close(pos, res)
+            if not self._is_dry_run():
+                self._sync_position_journal([])
         except Exception as exc:  # noqa: BLE001
             log.error("emergency flatten failed: %s", exc)
 

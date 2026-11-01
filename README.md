@@ -3,7 +3,7 @@
 Bot trading algoritmik **Arsitektur Hybrid 2-Lapis (`Intraday Bias + Scalper Execution`)** untuk PrimeXBT API v3 (`XAU/USD`, FX, dan CFD), didukung **Antisymmetric MTF Skip-TCN / LSTM-GRU / PatchTST-lite + PPO/SAC**, inferensi latensi rendah **ONNX Runtime (~103–111 µs p50)**, **Synthetic L2 Order Book**, risk engine berlapis yang tidak bisa ditawar model, serta eksekusi kausal yang memeriksa dampak likuiditas sebelum mengirim order.
 
 Mengapa **Arsitektur Hybrid**, bukan *pure scalper* satu timeframe?
-- **Layer 1 — Intraday Bias Engine (`15M` / `5M`)**: Menentukan arah struktural, nilai wajar lintas-logam (*Cross-Metal Fair-Value* `XAU/USD` vs `XAG/USD`), *Anchored Session VWAP* (`00:00 UTC`), *Volatility Regime Ratio*, dan *2H Efficiency Ratio* — sekaligus mem-veto entry melawan arus sesi, lonjakan volatilitas ekstrem, *macro event blackout* (`NFP`, `CPI`, `FOMC`), maupun jam *daily rollover* (`21:00–23:00 UTC`).
+- **Layer 1 — Intraday Bias Engine (`15M` / `5M`)**: Menentukan arah struktural, nilai wajar lintas-logam (*Cross-Metal Fair-Value* `XAU/USD` vs `XAG/USD`), *Anchored Session VWAP* (`22:00 UTC` — pembukaan sesi institusional FX/Emas seusai *daily rollover*), *Volatility Regime Ratio*, dan *2H Efficiency Ratio* — sekaligus mem-veto entry melawan arus sesi, lonjakan volatilitas ekstrem, *macro event blackout* (`NFP`, `CPI`, `FOMC`, jadwal resmi 2026–2027), maupun jam *daily rollover* (`21:00–23:00 UTC`).
 - **Layer 2 — Scalper Execution Engine (`5M` / `1M`)**: Mengeksekusi *timing* entry presisi hanya ketika dislokasi mikro selaras dengan *Intraday Bias*, didukung gerbang statis ONNX pada **Antisymmetric Skip-TCN**, konfirmasi *1M candle wick-absorption* (`close_location`), serta verifikasi spread & *market impact*.
 
 > ⚠️ **Baca ini dulu.** Trading dengan leverage tinggi dapat menghabiskan seluruh modal Anda. Repo ini adalah *trading & research engine* — bukan jaminan profit dan bukan nasihat keuangan. Edge nyata berasal dari **penyelarasan bias struktural, disiplin biaya eksekusi, dan pembatasan risiko ketat**, bukan dari keajaiban model semata. Selalu jalankan mode `paper` dan uji di **akun DEMO** PrimeXBT minimal beberapa minggu sebelum mempertimbangkan dana sungguhan.
@@ -82,7 +82,7 @@ pxs compound --config configs/live.hybrid.daily3pct_lock.yaml --days 30
                                  ▼
         2. LAYER 1 — IntradayBiasEngine (strategy/intraday_bias.py)
            • 15M / 5M Cross-Metal Fair-Value Dislocation (XAU/USD vs XAG/USD)
-           • Anchored Session VWAP (00:00 UTC) + 2H Kaufman Efficiency Ratio
+           • Anchored Session VWAP (22:00 UTC) + 2H Kaufman Efficiency Ratio
            • Volatility Regime Ratio (ATR pendek vs baseline sesi) & Rollover Gate
            Output: BiasSnapshot (BULLISH / BEARISH / NEUTRAL + skor & rezim)
                                  │
@@ -104,7 +104,7 @@ Setiap siklus bar yang dievaluasi (baik dieksekusi maupun di-*veto* oleh Bias at
 ### Kontrak Kausalitas Multi-Timeframe (Zero Look-Ahead)
 
 Kesalahan paling umum pada bot *multi-timeframe* adalah membaca candle `15M` bertanda waktu `10:00` pada eksekusi candle `5M` pukul `10:00` (padahal candle `15M` tersebut baru selesai pukul `10:15`). Di `pxscalper`:
-- `features/mtf.py::align_htf_to_ltf_causal` memaksakan ketaksamaan waktu penutupan bar:
+- `features/mtf.py::align_htf_to_ltf` memaksakan ketaksamaan waktu penutupan bar:
   $$T_{\text{htf}} + \Delta_{\text{htf}} \le t_{\text{ltf}} + \Delta_{\text{ltf}}$$
 - `live/engine.py::_closed_htf_slice` memotong bar HTF yang masih berjalan sebelum diteruskan ke pipeline fitur maupun `IntradayBiasEngine`, sehingga perilaku *backtest* dan *live* identik 100% (diuji secara adversarial di `tests/test_hybrid_architecture.py`).
 
@@ -158,7 +158,7 @@ python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\ac
 pip install -e ".[train,test]"                        # PyTorch, ONNX Runtime, scikit-learn, pytest
 
 cp .env.example .env      # isi PX_API_KEY + PX_API_SECRET bila ingin konek ke PrimeXBT
-pytest -q                 # 270 test (unit, kausalitas MTF, paritas train/serve, compounding, risk, orderbook, live/backtest) — tanpa network
+pytest -q                 # 291 test (unit, kausalitas MTF, paritas train/serve, compounding, risk, orderbook, live/backtest) — tanpa network
 pxs smoke                 # uji mandiri end-to-end offline dengan data sintetis
 ```
 
@@ -212,13 +212,14 @@ pxs risk show --config configs/live.mini100.hybrid.yaml
 # 6) Jalankan walk-forward backtest pada slice OOS (40% terakhir data)
 pxs backtest --config configs/live.hybrid.yaml --oos-frac 0.40
 
-# 7) Jalankan Paper Trading (polling harga & impact live, tanpa mengirim uang sungguhan)
-pxs trade --config configs/live.hybrid.yaml
-# atau untuk akun mini $100:
-pxs trade --config configs/live.mini100.hybrid.yaml
+# 7) Jalankan Paper Trading (simulasi siklus posisi paper penuh di atas harga & impact live, 0 order uang nyata)
+pxs trade --config configs/live.hybrid.yaml --mode paper
+# atau untuk akun mini $100 / kunci profit harian 3%:
+pxs trade --config configs/live.mini100.hybrid.yaml --mode paper
+pxs trade --config configs/live.hybrid.daily3pct_lock.yaml --mode paper
 
 # 8) Live Trading — WAJIB dua kunci pengaman eksplisit sekaligus:
-PX_LIVE_TRADING=1 pxs trade --config configs/live.hybrid.yaml --i-understand-the-risk
+PX_LIVE_TRADING=1 pxs trade --config configs/live.hybrid.yaml --mode live --i-understand-the-risk
 ```
 
 > **Kunci Pengaman Ganda:** Menjalankan `PX_LIVE_TRADING=1` **tanpa** flag `--i-understand-the-risk` (atau sebaliknya) akan tetap memaksa bot berjalan dalam mode **paper**. Untuk menghentikan bot seketika dan menutup posisi terbuka, jalankan `pxs kill --reason "manual stop"`.
@@ -256,7 +257,11 @@ Sebelum satu pun order diizinkan menyentuh `execution/router.py`, `risk/engine.p
    - `max_total_loss_pct` & `max_drawdown_pct` (kunci pengaman modal permanen),
    - `min_equity` (lantai ekuitas absolut, mis. `$60` pada akun `$100`),
    - *Cooldown* otomatis setelah `consecutive_loss_cooldown` kerugian beruntun + batas `max_daily_trades`.
-9. **Staged Basket & Profit Lock (`risk/basket.py`)**: Mendukung pembagian eksposur ke slot bertahap (`split_exposure_across_slots`) dan penutupan keranjang otomatis saat profit menyentuh `close_all_on_profit` (lihat `docs/MINI_ACCOUNT_100.md`).
+9. **Staged Basket & Profit Lock (`risk/basket.py`)**: Mendukung pembagian eksposur ke slot bertahap (`split_exposure_across_slots`) dan penutupan keranjang otomatis berbasis USD (`close_all_on_profit`) maupun persentase ekuitas majemuk (`close_all_on_profit_pct`, lihat `docs/MINI_ACCOUNT_100.md`).
+10. **Hybrid Compounding Engine & Daily Profit Target Latch (`risk/engine.py`, `live/engine.py`)**:
+   - Mode ukuran majemuk: `compound_mode: "daily"` (mengunci basis ekuitas harian setiap `00:00 UTC`), `"continuous"` (per-trade), atau `"fixed"` (modal awal).
+   - **Anti-Martingale Drawdown Scale (`compound_dd_scale`)**: Menurunkan risiko per trade secara otomatis saat ekuitas sedang mengalami *drawdown* dari puncak (`dd_scale_start_pct` → `dd_scale_min_factor`).
+   - **Daily Profit Target Lock (`daily_profit_target_pct` + `harvest_daily_profit_target`)**: Saat ekuitas menyentuh target harian (mis. `+3.0%`), bot otomatis memanen (*harvest*) seluruh posisi terbuka, mengunci bendera persisten `daily_target_locked=true` di `state/risk_state.json` (tahan terhadap *spread slippage* saat penutupan maupun *restart* proses di tengah hari), dan berhenti entry hingga pergantian hari `00:00 UTC`.
 
 ### Formula Sizing Berbasis Risiko (Tak Pernah Dibulatkan ke Atas)
 
@@ -272,6 +277,7 @@ Pengaturan risiko dapat diperiksa atau diubah tanpa merusak komentar YAML melalu
 
 ```bash
 pxs risk show --config configs/live.mini100.hybrid.yaml
+pxs risk set daily_profit_target_pct=2.0 --config configs/live.hybrid.daily3pct_lock.yaml --dry-run
 pxs risk set max_daily_trades=6 --config configs/live.mini100.hybrid.yaml --dry-run
 ```
 
@@ -322,7 +328,7 @@ src/pxscalper/
 configs/                    Preset produksi Hybrid ($10k 5M/1M, $100 Mini, & Compounding 3%/hari)
 scripts/training/           train_xau.py (pipeline Hybrid & single-TF XAU/USD), train_sl.py, train_rl.py
 scripts/                    export_models.py, calibrate.py, evaluate_real.py, xau_impact_ladder.py
-tests/                      270 test otomatis (tanpa koneksi jaringan & tanpa API key)
+tests/                      291 test otomatis (tanpa koneksi jaringan & tanpa API key)
 docs/                       XAUUSD_REPORT.md, MINI_ACCOUNT_100.md, MODEL_CARD.md, RUNBOOK.md, API_NOTES.md
 ```
 

@@ -31,10 +31,15 @@ log = logging.getLogger(__name__)
 __all__ = ["start_from_config", "build_engine"]
 
 
-def start_from_config(config_path: Path, allow_live: bool, paths: RepoPaths | None = None) -> None:
+def start_from_config(
+    config_path: Path,
+    allow_live: bool,
+    paths: RepoPaths | None = None,
+    max_bars: int | None = None,
+) -> None:
     engine = build_engine(config_path, allow_live=allow_live, paths=paths)
     engine.prepare()
-    engine.run()
+    engine.run(max_bars=max_bars)
 
 
 def build_engine(
@@ -210,7 +215,46 @@ def build_engine(
     risk = RiskEngine(risk_cfg, RiskState.load(risk_cfg.state_path))
 
     # -------------------------------------------------------------- reconcile
-    report = Reconciler(client, state_path=paths.root / "state" / "live_positions.json").run()
+    settings_by_symbol = {}
+    atr_by_symbol: dict[str, float] = {}
+    if allow_live:
+        try:
+            settings_by_symbol = {s.symbol: s for s in client.settings(symbols=symbols)}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("startup settings fetch skipped during reconcile: %s", exc)
+        for sym in symbols:
+            try:
+                recent = client.bars(sym, live_cfg.bar_size, limit=30)
+                if recent and len(recent) >= 5:
+                    import pandas as pd
+
+                    high = pd.Series([b.high for b in recent], dtype=float)
+                    low = pd.Series([b.low for b in recent], dtype=float)
+                    close = pd.Series([b.close for b in recent], dtype=float)
+                    prev = close.shift(1)
+                    tr = pd.concat(
+                        [high - low, (high - prev).abs(), (low - prev).abs()], axis=1
+                    ).max(axis=1)
+                    atr_by_symbol[sym] = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+            except Exception as exc:  # noqa: BLE001
+                log.debug("startup ATR fetch skipped for %s: %s", sym, exc)
+
+    state_file = (
+        Path(live_cfg.state_path)
+        if Path(live_cfg.state_path).is_absolute()
+        else (paths.root / live_cfg.state_path)
+    )
+    live_cfg.state_path = str(state_file)
+    report = Reconciler(
+        client,
+        state_path=state_file,
+        attach_stops=exec_cfg.attach_protection,
+        atr_by_symbol=atr_by_symbol,
+        sl_atr=risk_cfg.sl_atr,
+        dry_run=not allow_live,
+        allowed_symbols=symbols,
+        settings_by_symbol=settings_by_symbol,
+    ).run()
     if not report.ok:
         log.warning("reconcile reported issues: %s", report.errors)
 

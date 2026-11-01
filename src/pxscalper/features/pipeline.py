@@ -465,9 +465,21 @@ class FeatureEngineer:
         )
 
     def make_windows(
-        self, normalized: pd.DataFrame, lookback: int, drop_warmup: bool = True
+        self,
+        normalized: pd.DataFrame,
+        lookback: int,
+        drop_warmup: bool = True,
+        *,
+        contiguous: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """(N, C, L) float32 windows + the bar timestamp of each window's last row."""
+        """(N, C, L) float32 windows + the bar index of each window's last row.
+
+        ``sliding_window_view`` + slice indexing ``windows[start:]`` stays a
+        zero-copy view over ``values``. Passing ``contiguous=False`` avoids
+        materialising a multi-GB copy during sequential backtests (each per-bar
+        ``Predictor.predict`` call already copies its single ``(C, L)`` slice
+        into a pre-allocated contiguous buffer).
+        """
         values = normalized.to_numpy(dtype=np.float32, copy=False)
         n = len(values)
         if n < lookback:
@@ -476,9 +488,14 @@ class FeatureEngineer:
         last_ts = np.arange(lookback - 1, n, dtype=np.int64)  # positional bar index
         if drop_warmup:
             # rows before warmup are filled with zeros by normalize(); drop them
-            warmup = min(self.config.norm_min_periods + max(self.config.atr_window, self.config.regime_window), n)
-            keep = last_ts >= warmup
-            windows, last_ts = windows[keep], last_ts[keep]
+            warmup = min(
+                self.config.norm_min_periods + max(self.config.atr_window, self.config.regime_window),
+                n,
+            )
+            start = int(np.searchsorted(last_ts, warmup, side="left"))
+            windows, last_ts = windows[start:], last_ts[start:]
+        if not contiguous:
+            return windows, last_ts
         return np.ascontiguousarray(windows, dtype=np.float32), last_ts
 
     def last_window(

@@ -88,8 +88,8 @@ def _et(y: int, m: int, d: int, hour: int = 8, minute: int = 30) -> int:
     return int(datetime(y, m, d, hour, minute, tzinfo=ET).astimezone(UTC).timestamp() * 1000)
 
 
-#: Official 2026 releases. Times are announcement times in US/Eastern, sorted by
-#: instant: an unsorted schedule is a landmine for anything that walks it.
+#: Official 2026–2027 releases. Times are announcement times in US/Eastern, sorted
+#: by instant: an unsorted schedule is a landmine for anything that walks it.
 BUILTIN_SCHEDULE: tuple[MacroEvent, ...] = tuple(sorted(
     [MacroEvent("cpi", _et(2026, m, d)) for m, d in (
         (1, 13), (2, 13), (3, 11), (4, 10), (5, 12), (6, 10),
@@ -103,6 +103,18 @@ BUILTIN_SCHEDULE: tuple[MacroEvent, ...] = tuple(sorted(
     + [MacroEvent("fomc", _et(2026, m, d, 14, 0)) for m, d in (
         (1, 28), (3, 18), (4, 29), (6, 17), (7, 29),
         (9, 16), (10, 28), (12, 9),
+    )]
+    + [MacroEvent("cpi", _et(2027, m, d)) for m, d in (
+        (1, 13), (2, 10), (3, 10), (4, 13), (5, 12), (6, 10),
+        (7, 14), (8, 11), (9, 14), (10, 13), (11, 10), (12, 14),
+    )]
+    + [MacroEvent("nfp", _et(2027, m, d)) for m, d in (
+        (1, 8), (2, 5), (3, 5), (4, 2), (5, 7), (6, 4),
+        (7, 2), (8, 6), (9, 3), (10, 1), (11, 5), (12, 3),
+    )]
+    + [MacroEvent("fomc", _et(2027, m, d, 14, 0)) for m, d in (
+        (1, 27), (3, 17), (4, 28), (6, 9), (7, 28),
+        (9, 15), (10, 27), (12, 8),
     )],
     key=lambda e: e.time_ms,
 ))

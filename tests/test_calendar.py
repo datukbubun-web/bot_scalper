@@ -32,7 +32,7 @@ def _times(start_iso: str, n: int, bar_ms: int = 300_000) -> np.ndarray:
 def test_builtin_schedule_has_all_three_event_kinds():
     kinds = {e.kind for e in BUILTIN_SCHEDULE}
     assert kinds == {"nfp", "cpi", "fomc"}
-    assert len(BUILTIN_SCHEDULE) == 32      # 12 CPI + 12 NFP + 8 FOMC in 2026
+    assert len(BUILTIN_SCHEDULE) == 64      # 32 in 2026 + 32 in 2027 (12 CPI + 12 NFP + 8 FOMC/yr)
 
 
 def test_schedule_is_sorted_by_instant():
