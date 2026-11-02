@@ -1,0 +1,162 @@
+name: vps-bridge
+
+# =============================================================================
+#  Jembatan Arena.ai  <->  VPS Anda.
+#  Arena hanya punya akses HTTPS ke github.com / api.github.com / PyPI / npm,
+#  jadi SSH langsung ke IP VPS tidak mungkin. Workflow ini menjadi "bastion":
+#  runner GitHub yang men-SSH VPS, lalu menulis hasilnya kembali ke repo
+#  (ops/last_output.txt) supaya bisa dibaca Arena lewat git.
+#
+#  Cara pakai:
+#    1) Commit perubahan file ops/command.txt  -> workflow jalan otomatis.
+#       Isi baris perintah shell yang mau dijalankan di VPS, misal:
+#           @script scripts/vps_check.sh
+#           uptime && df -h && systemctl status pxscalper
+#    2) Atau klik "Run workflow" di tab Actions dan isi input command.
+#
+#  Secret yang dibutuhkan (Settings -> Secrets and variables -> Actions):
+#    VPS_HOST     = 156.246.91.184
+#    VPS_USER     = root
+#    VPS_SSH_KEY  = isi private key ed25519 (khusus, jangan yang utama)
+#    VPS_PORT     = 22   (opsional)
+#
+#  MATIKAN jembatan ini kapan saja: hapus 3 secret di atas, atau hapus public
+#  key dari ~/.ssh/authorized_keys di VPS.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Perintah di VPS, atau '@script <path>' untuk pipa file dari repo"
+        required: true
+        default: "@script scripts/vps_check.sh"
+  push:
+    paths:
+      - ops/command.txt
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vps-bridge
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Siapkan SSH key & known_hosts
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VPS_HOST:-}" ] || [ -z "${VPS_SSH_KEY:-}" ]; then
+            echo "::error::Secret VPS_HOST / VPS_SSH_KEY belum diisi (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # verifikasi key bisa dibaca & bentuknya benar
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
+          ssh-keyscan -p "${VPS_PORT:-22}" -t ed25519,rsa "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          chmod 600 ~/.ssh/known_hosts
+          echo "SSH key siap; host key terkumpul: $(wc -l < ~/.ssh/known_hosts) baris"
+
+      - name: Tentukan perintah
+        env:
+          INPUT_COMMAND: ${{ inputs.command }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            printf '%s\n' "$INPUT_COMMAND" > /tmp/cmd.txt
+          else
+            head -c 8000 ops/command.txt > /tmp/cmd.txt
+          fi
+          if ! grep -q '[^[:space:]]' /tmp/cmd.txt; then
+            echo "::error::Perintah kosong."; exit 1
+          fi
+          echo '--- perintah yang akan dijalankan ---'
+          cut -c1-300 /tmp/cmd.txt
+
+      - name: Jalankan di VPS
+        id: run
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -uo pipefail
+          PORT="${VPS_PORT:-22}"; SSH_USER="${VPS_USER:-root}"
+          OPTS=(-p "$PORT" -o BatchMode=yes -o ConnectTimeout=20
+                -o StrictHostKeyChecking=accept-new
+                -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+          CMD="$(cat /tmp/cmd.txt)"
+          set +e
+          case "$CMD" in
+            "@script "*)
+              SCRIPT="${CMD#@script }"
+              SCRIPT="$(printf '%s' "$SCRIPT" | tr -d '\r' | head -1 | sed 's/[[:space:]]*$//')"
+              if [ ! -f "$SCRIPT" ]; then
+                echo "::error::File script '$SCRIPT' tidak ada di repo." | tee /tmp/out.txt; rc=2
+              else
+                ssh "${OPTS[@]}" "$SSH_USER@$VPS_HOST" 'bash -s' < "$SCRIPT" 2>&1 | tee /tmp/out.txt
+                rc=${PIPESTATUS[0]}
+              fi ;;
+            *)
+              ssh "${OPTS[@]}" "$SSH_USER@$VPS_HOST" "$CMD" 2>&1 | tee /tmp/out.txt
+              rc=${PIPESTATUS[0]} ;;
+          esac
+          set -e
+          echo "exit-code=$rc" | tee -a /tmp/out.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Redaksi, potong & simpan hasil ke ops/last_output.txt
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p ops
+          [ -f /tmp/out.txt ] || echo "(tidak ada output)" > /tmp/out.txt
+          # buang ANSI, redaksi nilai rahasia, batasi 500 baris terakhir
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/out.txt \
+            | sed -E 's/((API_?KEY|SECRET|TOKEN|PASSWORD|PASS|PRIVATE)[A-Za-z0-9_]*[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1<redacted>/Ig' \
+            | tail -n 500 | cut -c1-400 > /tmp/clean.txt || true
+          CMD_ONE="$(tr -d '\r' < /tmp/cmd.txt | head -1 | cut -c1-200)"
+          {
+            echo "# output vps-bridge"
+            echo
+            echo "- waktu : $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo "- ref    : ${GITHUB_REF_NAME} (${GITHUB_EVENT_NAME})"
+            echo "- perintah: \`${CMD_ONE}\`"
+            echo "- run    : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '```'
+            cat /tmp/clean.txt
+            echo '```'
+          } > ops/last_output.txt
+
+      - name: Commit hasil kembali ke repo
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name  "vps-bridge[bot]"
+          git config user.email "vps-bridge@users.noreply.github.com"
+          git add ops/last_output.txt
+          if git diff --cached --quiet; then echo "Tidak ada perubahan output."; exit 0; fi
+          git commit -m "ops: hasil vps-bridge $(date -u '+%Y-%m-%d %H:%M:%SZ') [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Ringkas status
+        if: always()
+        run: |
+          rc="${{ steps.run.outputs.rc }}"
+          echo "exit code di VPS: ${rc:-?}"
+          if [ "${rc:-1}" != "0" ]; then
+            echo "::warning::Perintah selesai dengan exit code ${rc}. Cek ops/last_output.txt."
+          fi
